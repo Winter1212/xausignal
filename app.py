@@ -32,14 +32,14 @@ SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 
 # ---------------------- STRATEGY PARAMETERS (mirrors the Pine Script inputs) --------
 FAST_LEN = 9
-SLOW_LEN = 21
-RSI_LEN = 14
+SLOW_LEN = 20
+RSI_LEN = 20
 RSI_OB = 70
 RSI_OS = 30
 
-ATR_LEN = 14
-SL_MULT = 1.5
-RR1, RR2, RR3 = 1.0, 2.0, 3.0
+ATR_LEN = 12
+SL_MULT = 3
+RR1, RR2, RR3 = 1.43, 1.9, 2.5
 
 REQUIRE_BOTH_ALIGN = True
 ALLOW_COUNTER_TREND = True

@@ -1,5 +1,5 @@
 """
-Gold Signal Terminal — Free polling version (Finnhub data source)
+Gold Signal Terminal — Free polling version (no TradingView subscription needed)
 
 Re-implements the entry-signal logic from the original Pine Script indicator:
   - 9/21 EMA crossover
@@ -8,17 +8,7 @@ Re-implements the entry-signal logic from the original Pine Script indicator:
   - 1H + 4H trend agreement filter
   - Counter-trend setups allowed only when RSI is extreme AND reward:risk >= 2.5
 
-Data source: Finnhub (https://finnhub.io — free signup, no card required)
-  Uses the /forex/candle endpoint. Finnhub's supported candle resolutions are
-  1, 5, 15, 30, 60, D, W, M — there is no native "4h" resolution, so 4H bars
-  are built here by fetching 60-min candles and resampling them.
-
-  IMPORTANT: Finnhub has tightened free-tier access to candle data over time —
-  some free accounts get {"error": "You don't have access to this resource."}
-  on /forex/candle even with a valid key. Test the /test endpoint (or curl the
-  URL printed by fetch_candles' underlying request) right after deploying to
-  confirm your key actually has candle access before relying on this.
-
+Data source: Twelve Data free API (https://twelvedata.com — free signup, no card required)
 Alerts: sent directly to Telegram via the Bot API (no relay/Pipedream needed)
 
 Deploy as a Render free Web Service. Since Render free web services sleep when idle,
@@ -28,7 +18,6 @@ every 5 minutes — that keeps it awake and checks for new signals on schedule.
 
 import os
 import json
-import time
 import requests
 import pandas as pd
 from flask import Flask, jsonify
@@ -36,11 +25,10 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ---------------------- CONFIG (env vars, set these in Render) ----------------------
-FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-# Finnhub forex symbols are "EXCHANGE:BASE_QUOTE". OANDA:XAU_USD is spot gold vs USD.
-SYMBOL             = os.environ.get("SYMBOL", "OANDA:XAU_USD")
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
+TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
+SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 
 # ---------------------- STRATEGY PARAMETERS (mirrors the Pine Script inputs) --------
 FAST_LEN = 9
@@ -65,62 +53,26 @@ HTF2_INTERVAL = "4h"
 
 STATE_FILE = "state.json"
 
-# Maps our interval names to (Finnhub resolution, seconds-per-base-candle).
-# "4h" has no native Finnhub resolution, so we fetch 60-min candles and resample.
-_INTERVAL_MAP = {
-    "5min": ("5", 300),
-    "1h": ("60", 3600),
-    "4h": ("60", 3600),
-}
-
 
 # ---------------------- DATA FETCH ----------------------
 def fetch_candles(interval, outputsize=100):
-    resolution, base_seconds = _INTERVAL_MAP[interval]
-
-    # How many BASE-resolution candles do we need before any resampling?
-    base_count = outputsize * 4 if interval == "4h" else outputsize
-
-    # Forex is closed roughly 2 days out of 7, so pad the requested time span
-    # generously to make sure we still end up with `outputsize` closed candles.
-    buffer_factor = 1.6
-    span_seconds = int(base_count * base_seconds * buffer_factor)
-
-    to_ts = int(time.time())
-    from_ts = to_ts - span_seconds
-
-    url = "https://finnhub.io/api/v1/forex/candle"
+    url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
-        "resolution": resolution,
-        "from": from_ts,
-        "to": to_ts,
-        "token": FINNHUB_API_KEY,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "order": "ASC",
     }
     r = requests.get(url, params=params, timeout=15)
     data = r.json()
-    if data.get("s") != "ok":
-        raise RuntimeError(f"Finnhub error for {interval}: {data}")
-
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(data["t"], unit="s", utc=True),
-        "open": data["o"],
-        "high": data["h"],
-        "low": data["l"],
-        "close": data["c"],
-    })
+    if "values" not in data:
+        raise RuntimeError(f"Twelve Data error for {interval}: {data}")
+    df = pd.DataFrame(data["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
     df = df.sort_values("datetime").reset_index(drop=True)
-
-    if interval == "4h":
-        df = (
-            df.set_index("datetime")
-              .resample("4h")
-              .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-              .dropna()
-              .reset_index()
-        )
-
-    df = df.tail(outputsize).reset_index(drop=True)
     return df
 
 
@@ -185,7 +137,7 @@ def send_telegram(text):
 # ---------------------- CORE CHECK ----------------------
 @app.route("/check", methods=["GET"])
 def check():
-    if not FINNHUB_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TWELVE_DATA_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     entry_df = fetch_candles(ENTRY_INTERVAL, outputsize=100)
@@ -277,7 +229,7 @@ def test_signal():
     waiting for a real EMA crossover. Does NOT check state.json, so you can
     call this as many times as you want without it blocking real alerts.
     """
-    if not FINNHUB_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TWELVE_DATA_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     entry_df = fetch_candles(ENTRY_INTERVAL, outputsize=100)

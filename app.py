@@ -220,6 +220,42 @@ def check():
     return jsonify(result)
 
 
+@app.route("/test", methods=["GET"])
+def test_signal():
+    """
+    Forces a fake BUY signal through the exact same message-building and
+    Telegram-sending code as a real signal, using live price data for
+    realistic numbers. Use this to confirm the full pipeline works without
+    waiting for a real EMA crossover. Does NOT check state.json, so you can
+    call this as many times as you want without it blocking real alerts.
+    """
+    if not TWELVE_DATA_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return jsonify({"error": "Missing required environment variables"}), 500
+
+    entry_df = fetch_candles(ENTRY_INTERVAL, outputsize=100)
+    entry_df["atr"] = atr(entry_df, ATR_LEN)
+    last = entry_df.iloc[-1]
+
+    entry = last["close"]
+    risk = last["atr"] * SL_MULT
+    sl = entry - risk
+    tp1, tp2, tp3 = entry + risk * RR1, entry + risk * RR2, entry + risk * RR3
+
+    msg = (
+        f"[TEST] XAUUSD BUY signal (Trend)\n"
+        f"Entry: {entry:.2f}\n"
+        f"SL: {sl:.2f}\n"
+        f"TP1: {tp1:.2f}\n"
+        f"TP2: {tp2:.2f}\n"
+        f"TP3: {tp3:.2f}\n"
+        f"Bar: {last['datetime']}\n"
+        f"(This is a forced test message, not a real signal)"
+    )
+    send_telegram(msg)
+
+    return jsonify({"status": "test message sent", "message": msg})
+
+
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})

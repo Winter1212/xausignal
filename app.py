@@ -31,13 +31,13 @@ TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 
 # ---------------------- STRATEGY PARAMETERS (mirrors the Pine Script inputs) --------
-FAST_LEN = 9
+FAST_LEN = 10
 SLOW_LEN = 20
 RSI_LEN = 20
 RSI_OB = 70
 RSI_OS = 30
 
-ATR_LEN = 12
+ATR_LEN = 10
 SL_MULT = 3
 RR1, RR2, RR3 = 1.45, 1.9, 2.5
 

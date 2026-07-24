@@ -43,30 +43,48 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ---------------------- CONFIG (env vars, set these in Render) ----------------------
-TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
+# Multi-key rotation: set up to 3 separate Twelve Data API keys
+# (TWELVE_DATA_API_KEY_1/2/3) to spread requests across accounts and get up
+# to 3x the daily credit budget of a single free-tier key. You can also set
+# just TWELVE_DATA_API_KEY_1 alone if you only have one key. Falls back to
+# the legacy single-var TWELVE_DATA_API_KEY if none of the numbered vars
+# are set.
+_raw_keys = [
+    os.environ.get("TWELVE_DATA_API_KEY_1", ""),
+    os.environ.get("TWELVE_DATA_API_KEY_2", ""),
+    os.environ.get("TWELVE_DATA_API_KEY_3", ""),
+]
+TWELVE_DATA_API_KEYS = [k for k in _raw_keys if k]
+if not TWELVE_DATA_API_KEYS:
+    legacy = os.environ.get("TWELVE_DATA_API_KEY", "")
+    if legacy:
+        TWELVE_DATA_API_KEYS = [legacy]
+
 TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the ONE chart timeframe, matches the indicator
 
+KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
+
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
-FAST_LEN = 12
-SLOW_LEN = 35
+FAST_LEN = 9
+SLOW_LEN = 21
 USE_RSI = True
-RSI_LEN = 15
+RSI_LEN = 14
 RSI_OB = 70   # block buys above this
 RSI_OS = 30   # block sells below this
 
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
-ST_ATR_PERIOD = 15
-ST_FACTOR = 5.0
+ST_ATR_PERIOD = 10
+ST_FACTOR = 3.0
 
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
-ATR_LEN = 12
-SL_MULT = 1
-SL_MIN_PTS = 10
-SL_MAX_PTS = 12
-RR1, RR2, RR3 = 1.8, 2.5, 3.0
+ATR_LEN = 14
+SL_MULT = 1.5
+SL_MIN_PTS = 10.0
+SL_MAX_PTS = 12.0
+RR1, RR2, RR3 = 1.0, 2.0, 3.0
 
 TP1_CLOSE_PCT = 50          # % of ORIGINAL position closed at TP1 (Partial mode only)
 TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (Partial mode only)
@@ -84,26 +102,94 @@ UNITS_PER_LOT = float(os.environ.get("UNITS_PER_LOT", 100))
 STATE_FILE = "state.json"
 
 
-# ---------------------- DATA FETCH ----------------------
-def fetch_candles(interval, outputsize=200):
+# ---------------------- API KEY ROTATION ----------------------
+def _load_key_state():
+    today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    if os.path.exists(KEY_STATE_FILE):
+        with open(KEY_STATE_FILE) as f:
+            ks = json.load(f)
+    else:
+        ks = {}
+    if ks.get("date") != today:
+        # new UTC day -> reset per-key usage counters
+        ks = {"date": today, "next_index": 0, "usage": {}}
+    ks.setdefault("next_index", 0)
+    ks.setdefault("usage", {})
+    return ks
+
+
+def _save_key_state(ks):
+    with open(KEY_STATE_FILE, "w") as f:
+        json.dump(ks, f, indent=2)
+
+
+def _key_label(i):
+    return f"key_{i + 1}"
+
+
+def fetch_candles(interval, outputsize=200, credits_per_call=3):
+    """
+    Fetches candles from Twelve Data, rotating across up to 3 configured API
+    keys. Each call advances the rotation by one key (round-robin), and
+    tracks approximate credit usage per key per UTC day in KEY_STATE_FILE
+    purely for visibility via /keys. If a key comes back rate-limited (HTTP
+    429 or a Twelve Data error payload mentioning the limit), it
+    automatically retries the SAME request on the next key instead of
+    failing the whole /check call.
+    """
+    if not TWELVE_DATA_API_KEYS:
+        raise RuntimeError("No Twelve Data API key configured. Set TWELVE_DATA_API_KEY_1 (and optionally _2 / _3).")
+
+    ks = _load_key_state()
     url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": SYMBOL,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_API_KEY,
-        "order": "ASC",
-    }
-    r = requests.get(url, params=params, timeout=15)
-    data = r.json()
-    if "values" not in data:
-        raise RuntimeError(f"Twelve Data error for {interval}: {data}")
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
+    n = len(TWELVE_DATA_API_KEYS)
+    last_error = None
+
+    for attempt in range(n):
+        idx = (ks["next_index"] + attempt) % n
+        key = TWELVE_DATA_API_KEYS[idx]
+        params = {
+            "symbol": SYMBOL,
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": key,
+            "order": "ASC",
+        }
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            data = r.json()
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        rate_limited = (
+            r.status_code == 429
+            or (isinstance(data, dict) and data.get("code") in (429, 8, 400) and "limit" in str(data.get("message", "")).lower())
+        )
+
+        if "values" in data:
+            # success on this key -> record usage, advance rotation past it,
+            # persist, and return
+            label = _key_label(idx)
+            ks["usage"][label] = ks["usage"].get(label, 0) + credits_per_call
+            ks["next_index"] = (idx + 1) % n
+            _save_key_state(ks)
+
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+            df = df.sort_values("datetime").reset_index(drop=True)
+            return df
+
+        last_error = data
+        if not rate_limited:
+            # A non-rate-limit error (bad symbol, bad interval, etc.) will
+            # fail the same way on every key, so don't bother rotating.
+            break
+        # else: rate-limited -> loop continues and tries the next key
+
+    raise RuntimeError(f"Twelve Data error for {interval} (tried {min(attempt + 1, n)} key(s)): {last_error}")
 
 
 # ---------------------- INDICATORS ----------------------
@@ -467,7 +553,7 @@ def open_position(side, entry, sl, tp1, tp2, tp3, bar_time):
 # ---------------------- CORE CHECK ----------------------
 @app.route("/check", methods=["GET"])
 def check():
-    if not TWELVE_DATA_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TWELVE_DATA_API_KEYS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     df = fetch_candles(TIMEFRAME, outputsize=200)
@@ -568,7 +654,7 @@ def stats():
 def test_signal():
     """Sends a forced test message through the real Telegram path using live
     price data. Does not touch state.json or open a real position."""
-    if not TWELVE_DATA_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TWELVE_DATA_API_KEYS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     df = fetch_candles(TIMEFRAME, outputsize=100)
@@ -595,9 +681,22 @@ def test_signal():
     return jsonify({"status": "test message sent", "message": msg})
 
 
+@app.route("/keys", methods=["GET"])
+def keys_status():
+    """Shows how many keys are configured, rotation position, and today's
+    approximate credit usage per key (resets at UTC midnight)."""
+    ks = _load_key_state()
+    return jsonify({
+        "configured_keys": len(TWELVE_DATA_API_KEYS),
+        "date_utc": ks["date"],
+        "next_key_index": ks["next_index"] + 1,  # 1-based for readability
+        "usage_today": ks["usage"],
+    })
+
+
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "keys_configured": len(TWELVE_DATA_API_KEYS)})
 
 
 if __name__ == "__main__":

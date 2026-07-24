@@ -17,6 +17,17 @@ This is a 1:1 re-implementation of the Pine Script v6 indicator
     bearish. This is the fix for "overall trend is up, a small pullback
     flips the entry-TF Supertrend, we short, and get stopped as price
     resumes up." Costs one extra API call per poll (see CONFIG below).
+  - Daily Trade Guarantee — mirrors the indicator's "Daily Trade Guarantee"
+    group. If no organic BUY/SELL has opened a trade yet today by the
+    configured Force-Entry Hour/Minute, the bot forces one entry in the
+    direction of the prevailing trend (entry-TF Supertrend, falling back to
+    HTF Supertrend, falling back to EMA position) so every day gets at
+    least one trade. Forced entries are tagged "(Forced Daily)" everywhere
+    (Telegram message + trade log) so you can evaluate/disable them
+    separately from organic "(Supertrend)" signals. Exactly like the
+    indicator, this does NOT loosen the organic filters — it's a
+    separately-tagged fallback that only fires when the day would
+    otherwise end with zero trades.
   - ATR(14) x 1.5 stop distance, clamped into a fixed [10, 12] point band
   - TP1 = 1R, TP2 = 2R, TP3 = 3R
   - Stop loss NEVER moves to breakeven. It stays fixed at its original
@@ -46,6 +57,16 @@ of one — your entry timeframe AND the higher timeframe. This roughly
 doubles Twelve Data credit consumption per poll. If you're tight on free-tier
 credits, either set USE_HTF=false or add more keys via
 TWELVE_DATA_API_KEY_2 / _3.
+
+NOTE ON THE DAILY TRADE GUARANTEE AND TIME ZONES: Twelve Data's time_series
+"datetime" values are in the EXCHANGE'S timezone by default (the same thing
+Pine's "chart/exchange time" hour/minute refers to), so FORCE_HOUR /
+FORCE_MINUTE below are interpreted against that same bar timestamp — no
+extra timezone conversion is done. If you fetch with a different `timezone`
+param, adjust FORCE_HOUR/FORCE_MINUTE accordingly. Also note (same caveat as
+the indicator): if TIMEFRAME is a daily-or-higher bar, every bar's
+hour/minute will be the same value, so set FORCE_HOUR/FORCE_MINUTE to 0/0 in
+that case or just use this bot on an intraday timeframe.
 """
 
 import os
@@ -82,16 +103,16 @@ TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart ti
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
-FAST_LEN = 9
-SLOW_LEN = 21
+FAST_LEN = 12
+SLOW_LEN = 35
 USE_RSI = True
-RSI_LEN = 14
+RSI_LEN = 15
 RSI_OB = 70   # block buys above this
 RSI_OS = 30   # block sells below this
 
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
-ST_ATR_PERIOD = 10
-ST_FACTOR = 3.0
+ST_ATR_PERIOD = 15
+ST_FACTOR = 5
 # Require a Supertrend flip to hold this many bars before it's tradeable
 # (matches indicator's "stConfirmBars" input, default 2).
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
@@ -103,16 +124,26 @@ ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
 USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
 # Twelve Data interval strings, NOT Pine's "60" minute-count style.
 # Indicator default is "60" minutes -> Twelve Data equivalent is "1h".
-HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "1h")
+HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "4h")
 HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 10))
 HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 3.0))
 
+# ---------------------- DAILY TRADE GUARANTEE (exact indicator defaults) ----------------------
+# Matches the indicator's "Daily Trade Guarantee" group. If nothing organic
+# has opened a trade yet today by FORCE_HOUR:FORCE_MINUTE, force one entry
+# in the direction of the prevailing trend so every day gets >= 1 trade.
+# This is a SEPARATE, clearly-tagged fallback — it never loosens the
+# organic EMA/RSI/Supertrend/HTF stack above.
+GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
+FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 22))   # 0-23, exchange time (see NOTE above)
+FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
+
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
-ATR_LEN = 14
-SL_MULT = 1.5
+ATR_LEN = 12
+SL_MULT = 1
 SL_MIN_PTS = 10.0
-SL_MAX_PTS = 12.0
-RR1, RR2, RR3 = 1.0, 2.0, 3.0
+SL_MAX_PTS = 10.0
+RR1, RR2, RR3 = 1.8, 2.8, 3.5
 
 TP1_CLOSE_PCT = 50          # % of ORIGINAL position closed at TP1 (Partial mode only)
 TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (Partial mode only)
@@ -331,6 +362,10 @@ DEFAULT_STATE = {
         "total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
         "best_trade": None, "worst_trade": None,
     },
+    # --- Daily Trade Guarantee tracking (mirrors tradedToday / forceAttemptedTdy) ---
+    "current_day": None,       # "YYYY-MM-DD" of the last bar we processed
+    "traded_today": False,     # flips true the instant ANY trade (organic or forced) opens
+    "force_attempted_today": False,  # true once we've made our one forced-entry attempt today
 }
 
 
@@ -598,6 +633,52 @@ def open_position(side, entry, sl, tp1, tp2, tp3, bar_time):
     }
 
 
+# ---------------------- DAILY TRADE GUARANTEE HELPERS ----------------------
+def roll_daily_guarantee_state(state, bar_dt):
+    """Mirrors the indicator's `newDay` reset block: whenever the bar's
+    calendar day changes vs. the last bar we processed, reset
+    traded_today / force_attempted_today for the new day."""
+    day_str = bar_dt.strftime("%Y-%m-%d")
+    if state.get("current_day") != day_str:
+        state["current_day"] = day_str
+        state["traded_today"] = False
+        state["force_attempted_today"] = False
+
+
+def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_last):
+    """
+    Mirrors the indicator's forceEntryNow / forceDirection logic exactly:
+
+      isPastForceTime = (hour*60+minute) >= (forceHour*60+forceMinute)
+      forceEntryNow    = guaranteeDailyTrade and isPastForceTime
+                          and not forceAttemptedTdy and not tradedToday
+                          and flat
+      forceDirection   = entry-TF Supertrend, else HTF Supertrend,
+                          else EMA position (always resolves to +-1)
+
+    Returns (force_entry_now: bool, force_direction: int [1 or -1]).
+    """
+    if not GUARANTEE_DAILY_TRADE:
+        return False, 0
+
+    is_past_force_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HOUR * 60 + FORCE_MINUTE)
+    force_entry_now = (
+        is_past_force_time
+        and not state["force_attempted_today"]
+        and not state["traded_today"]
+        and state["position"] is None
+    )
+
+    if st_dir == 1 or st_dir == -1:
+        force_direction = st_dir
+    elif htf_dir == 1 or htf_dir == -1:
+        force_direction = htf_dir
+    else:
+        force_direction = 1 if ema_fast_last >= ema_slow_last else -1
+
+    return force_entry_now, force_direction
+
+
 # ---------------------- CORE CHECK ----------------------
 @app.route("/check", methods=["GET"])
 def check():
@@ -618,6 +699,10 @@ def check():
 
     state = load_state()
     result = {"bar_time": bar_time, "event": None}
+
+    # 0) Roll the Daily Trade Guarantee's day-tracking forward if this bar
+    #    is a new calendar day (mirrors the indicator's `newDay` reset).
+    roll_daily_guarantee_state(state, last["datetime"])
 
     # 1) Manage an already-open position against this bar's high/low
     if state["position"] is not None and state.get("last_exit_bar") != bar_time:
@@ -656,28 +741,52 @@ def check():
         long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
         short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
 
+        # --- Daily Trade Guarantee: forced fallback entry (matches forceEntryNow/forceDirection) ---
+        # NOTE: if USE_HTF is False, htf_dir stays 0 above; compute_force_entry
+        # still falls back to HTF Supertrend direction when the entry-TF
+        # Supertrend is flat, so it fetches HTF Supertrend direction only
+        # when USE_HTF already fetched it, otherwise falls through to EMA.
+        force_entry_now, force_direction = compute_force_entry(
+            state, last["datetime"], int(last["st_dir"]), htf_dir,
+            last["emaFast"], last["emaSlow"],
+        )
+        force_long_cond = force_entry_now and force_direction == 1
+        force_short_cond = force_entry_now and force_direction == -1
+
+        is_long_entry = long_cond or force_long_cond
+        is_short_entry = short_cond or force_short_cond
+
         state["last_signal_bar"] = bar_time
 
-        if long_cond or short_cond:
+        if is_long_entry or is_short_entry:
             entry = last["close"]
             sl_dist = min(max(last["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
 
-            if long_cond:
+            if is_long_entry:
                 sl = entry - sl_dist
                 risk = entry - sl
                 tp1, tp2, tp3 = entry + risk * RR1, entry + risk * RR2, entry + risk * RR3
                 side = "BUY"
+                is_forced = force_long_cond and not long_cond
             else:
                 sl = entry + sl_dist
                 risk = sl - entry
                 tp1, tp2, tp3 = entry - risk * RR1, entry - risk * RR2, entry - risk * RR3
                 side = "SELL"
+                is_forced = force_short_cond and not short_cond
 
             state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, bar_time)
 
+            # Mark the Daily Trade Guarantee as satisfied for today, exactly
+            # like the indicator setting tradedToday/forceAttemptedTdy on
+            # ANY entry (organic or forced).
+            state["traded_today"] = True
+            state["force_attempted_today"] = True
+
+            tag = "(Forced Daily)" if is_forced else "(Supertrend)"
             htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(htf_dir)}\n" if USE_HTF else ""
             msg = (
-                f"XAUUSD {side} signal (Supertrend)\n"
+                f"XAUUSD {side} signal {tag}\n"
                 f"Entry: {entry:.2f}\n"
                 f"SL: {sl:.2f}\n"
                 f"TP1: {tp1:.2f}\n"
@@ -690,7 +799,14 @@ def check():
             send_telegram(msg)
             result["event"] = "entry"
             result["side"] = side
+            result["forced"] = is_forced
             result["message"] = msg
+        elif force_entry_now:
+            # Force-entry time passed, but direction resolution somehow
+            # produced neither (shouldn't happen since forceDirection always
+            # resolves to +-1) — mark the attempt so we don't retry forever
+            # on subsequent bars today.
+            state["force_attempted_today"] = True
 
         save_state(state)
 
@@ -710,6 +826,14 @@ def stats():
         "net_pnl": round(s["sum_pnl"], 2),
         "best_trade": s["best_trade"], "worst_trade": s["worst_trade"],
         "recent_log": state["history"][:10],
+        "daily_guarantee": {
+            "enabled": GUARANTEE_DAILY_TRADE,
+            "force_hour": FORCE_HOUR,
+            "force_minute": FORCE_MINUTE,
+            "current_day": state.get("current_day"),
+            "traded_today": state.get("traded_today"),
+            "force_attempted_today": state.get("force_attempted_today"),
+        },
     })
 
 
@@ -765,6 +889,9 @@ def health():
         "use_htf": USE_HTF,
         "htf_timeframe": HTF_TIMEFRAME if USE_HTF else None,
         "st_confirm_bars": ST_CONFIRM_BARS,
+        "guarantee_daily_trade": GUARANTEE_DAILY_TRADE,
+        "force_hour": FORCE_HOUR,
+        "force_minute": FORCE_MINUTE,
     })
 
 

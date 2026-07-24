@@ -2,14 +2,21 @@
 Gold Signal Terminal — Free polling bot (no TradingView subscription needed)
 
 This is a 1:1 re-implementation of the Pine Script v6 indicator
-"Gold Signal Terminal — Entry/SL/TP1-3 + Winrate + Supertrend":
+"Gold Signal Terminal — Entry/SL/TP1-3 + Winrate + Supertrend", INCLUDING:
 
   - 9/21 EMA crossover entries
   - RSI(14) filter (blocks buys above 70, sells below 30)
-  - Supertrend(10, 3.0) trend filter — a signal only fires WITH the
-    Supertrend direction (this replaces any multi-timeframe filter; the
-    indicator only ever looks at the ONE chart timeframe, so this bot only
-    ever polls ONE timeframe too)
+  - Supertrend(10, 3.0) trend filter on the entry timeframe — a signal only
+    fires WITH the Supertrend direction
+  - Supertrend "flip confirmation" — a fresh flip must hold for
+    ST_CONFIRM_BARS bars before it's allowed to trigger a trade. This is
+    what stops the bot from entering on the exact bar of a flip that then
+    immediately reverses back (classic whipsaw).
+  - Higher-timeframe Supertrend confirmation — BUY signals additionally
+    require the HTF Supertrend to be bullish, SELL signals require it to be
+    bearish. This is the fix for "overall trend is up, a small pullback
+    flips the entry-TF Supertrend, we short, and get stopped as price
+    resumes up." Costs one extra API call per poll (see CONFIG below).
   - ATR(14) x 1.5 stop distance, clamped into a fixed [10, 12] point band
   - TP1 = 1R, TP2 = 2R, TP3 = 3R
   - Stop loss NEVER moves to breakeven. It stays fixed at its original
@@ -32,6 +39,13 @@ Deploy as a Render free Web Service. Since Render free web services sleep
 when idle, use a free external pinger (e.g. https://cron-job.org) to hit the
 /check endpoint every 5 minutes (or however often TIMEFRAME closes) to keep
 it awake and checked on schedule.
+
+NOTE ON API CREDIT USAGE: enabling USE_HTF (on by default, matching the
+indicator's default) means every /check call fetches TWO timeframes instead
+of one — your entry timeframe AND the higher timeframe. This roughly
+doubles Twelve Data credit consumption per poll. If you're tight on free-tier
+credits, either set USE_HTF=false or add more keys via
+TWELVE_DATA_API_KEY_2 / _3.
 """
 
 import os
@@ -63,7 +77,7 @@ if not TWELVE_DATA_API_KEYS:
 TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
-TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the ONE chart timeframe, matches the indicator
+TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
@@ -78,6 +92,20 @@ RSI_OS = 30   # block sells below this
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
 ST_ATR_PERIOD = 10
 ST_FACTOR = 3.0
+# Require a Supertrend flip to hold this many bars before it's tradeable
+# (matches indicator's "stConfirmBars" input, default 2).
+ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
+
+# ---------------------- HIGHER TIMEFRAME CONFIRMATION (exact indicator defaults) ----------------------
+# Matches the indicator's "Higher Timeframe Confirmation" group. Only takes
+# BUY signals when the HTF Supertrend is bullish, only takes SELL signals
+# when it's bearish.
+USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
+# Twelve Data interval strings, NOT Pine's "60" minute-count style.
+# Indicator default is "60" minutes -> Twelve Data equivalent is "1h".
+HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "1h")
+HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 10))
+HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 3.0))
 
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
 ATR_LEN = 14
@@ -267,6 +295,26 @@ def supertrend(df, period, factor):
         st.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
 
     return st, direction
+
+
+def bars_since_supertrend_flip(dir_series):
+    """
+    Mirrors the indicator's stFlipBar / barsSinceFlip logic: walks backward
+    from the last bar counting how many consecutive bars have held the
+    CURRENT direction. 0 means the current bar IS the flip bar (direction
+    just changed this bar); 1 means it held for one bar after the flip, etc.
+    """
+    n = len(dir_series)
+    if n == 0:
+        return 9999
+    last_dir = dir_series.iloc[-1]
+    count = 0
+    for i in range(n - 1, -1, -1):
+        if dir_series.iloc[i] == last_dir:
+            count += 1
+        else:
+            break
+    return count - 1  # bars since flip (matches Pine's bar_index - stFlipBar)
 
 
 def trend_arrow(d):
@@ -592,8 +640,21 @@ def check():
         st_bullish = last["st_dir"] == 1
         st_bearish = last["st_dir"] == -1
 
-        long_cond = ema_cross_up and rsi_ok_long and st_bullish
-        short_cond = ema_cross_down and rsi_ok_short and st_bearish
+        # --- Supertrend flip-confirmation (matches indicator's stFlipConfirmed) ---
+        bars_since_flip = bars_since_supertrend_flip(dir_series)
+        st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
+
+        # --- Higher-timeframe Supertrend confirmation (matches useHTF) ---
+        htf_dir = 0
+        if USE_HTF:
+            htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=100)
+            _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
+            htf_dir = int(htf_dir_series.iloc[-1])
+        htf_bullish = (not USE_HTF) or htf_dir == 1
+        htf_bearish = (not USE_HTF) or htf_dir == -1
+
+        long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
+        short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
 
         state["last_signal_bar"] = bar_time
 
@@ -614,6 +675,7 @@ def check():
 
             state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, bar_time)
 
+            htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(htf_dir)}\n" if USE_HTF else ""
             msg = (
                 f"XAUUSD {side} signal (Supertrend)\n"
                 f"Entry: {entry:.2f}\n"
@@ -621,7 +683,8 @@ def check():
                 f"TP1: {tp1:.2f}\n"
                 f"TP2: {tp2:.2f}\n"
                 f"TP3: {tp3:.2f}\n"
-                f"Supertrend: {trend_arrow(last['st_dir'])}\n"
+                f"Supertrend ({TIMEFRAME}): {trend_arrow(last['st_dir'])}\n"
+                f"{htf_line}"
                 f"Bar: {bar_time}"
             )
             send_telegram(msg)
@@ -696,7 +759,13 @@ def keys_status():
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "keys_configured": len(TWELVE_DATA_API_KEYS)})
+    return jsonify({
+        "status": "ok",
+        "keys_configured": len(TWELVE_DATA_API_KEYS),
+        "use_htf": USE_HTF,
+        "htf_timeframe": HTF_TIMEFRAME if USE_HTF else None,
+        "st_confirm_bars": ST_CONFIRM_BARS,
+    })
 
 
 if __name__ == "__main__":

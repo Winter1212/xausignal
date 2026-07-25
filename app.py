@@ -58,15 +58,23 @@ doubles Twelve Data credit consumption per poll. If you're tight on free-tier
 credits, either set USE_HTF=false or add more keys via
 TWELVE_DATA_API_KEY_2 / _3.
 
-NOTE ON THE DAILY TRADE GUARANTEE AND TIME ZONES: Twelve Data's time_series
-"datetime" values are in the EXCHANGE'S timezone by default (the same thing
-Pine's "chart/exchange time" hour/minute refers to), so FORCE_HOUR /
-FORCE_MINUTE below are interpreted against that same bar timestamp — no
-extra timezone conversion is done. If you fetch with a different `timezone`
-param, adjust FORCE_HOUR/FORCE_MINUTE accordingly. Also note (same caveat as
-the indicator): if TIMEFRAME is a daily-or-higher bar, every bar's
-hour/minute will be the same value, so set FORCE_HOUR/FORCE_MINUTE to 0/0 in
-that case or just use this bot on an intraday timeframe.
+NOTE ON THE DAILY TRADE GUARANTEE AND TIME ZONES: every call to Twelve
+Data's time_series endpoint below passes a `timezone` parameter
+(FORCE_TIMEZONE, default "Asia/Bangkok" — same UTC+7 offset as Cambodia,
+and more consistently supported by Twelve Data's timezone list than
+"Asia/Phnom_Penh"). That makes Twelve Data return each bar's "datetime"
+value ALREADY LOCALIZED to that zone, rather than in the exchange's raw
+timezone. FORCE_HOUR / FORCE_MINUTE are then compared directly against
+that localized timestamp, so "9:00" means 9:00am in FORCE_TIMEZONE
+regardless of what timezone the underlying exchange feed uses. If you want
+a different session's local time instead of Cambodia, just change
+FORCE_TIMEZONE to another IANA zone (e.g. "America/New_York",
+"Europe/London") — every downstream calculation (day-of-week/day boundary,
+force-entry check) follows automatically since it's all derived from the
+same localized "datetime" column. Also note (same caveat as the indicator):
+if TIMEFRAME is a daily-or-higher bar, every bar's hour/minute will be the
+same value (typically 00:00), so set FORCE_HOUR/FORCE_MINUTE to 0/0 in that
+case or just use this bot on an intraday timeframe.
 """
 
 import os
@@ -100,6 +108,12 @@ TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
+# IANA timezone Twelve Data localizes every bar's "datetime" value into
+# (see the big NOTE at the top of this file). Default is Cambodia's
+# UTC+7 offset via "Asia/Bangkok". This drives the Daily Trade Guarantee's
+# day-boundary AND its FORCE_HOUR/FORCE_MINUTE check below.
+FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Bangkok")
+
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
@@ -130,12 +144,13 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 3.0))
 
 # ---------------------- DAILY TRADE GUARANTEE (exact indicator defaults) ----------------------
 # Matches the indicator's "Daily Trade Guarantee" group. If nothing organic
-# has opened a trade yet today by FORCE_HOUR:FORCE_MINUTE, force one entry
-# in the direction of the prevailing trend so every day gets >= 1 trade.
-# This is a SEPARATE, clearly-tagged fallback — it never loosens the
+# has opened a trade yet today by FORCE_HOUR:FORCE_MINUTE (evaluated in
+# FORCE_TIMEZONE, default Cambodia/UTC+7 — see NOTE at top of file), force
+# one entry in the direction of the prevailing trend so every day gets >= 1
+# trade. This is a SEPARATE, clearly-tagged fallback — it never loosens the
 # organic EMA/RSI/Supertrend/HTF stack above.
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
-FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 22))   # 0-23, exchange time (see NOTE above)
+FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))    # 0-23, in FORCE_TIMEZONE (see NOTE above)
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
 
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
@@ -195,6 +210,13 @@ def fetch_candles(interval, outputsize=200, credits_per_call=3):
     429 or a Twelve Data error payload mentioning the limit), it
     automatically retries the SAME request on the next key instead of
     failing the whole /check call.
+
+    Passes `timezone=FORCE_TIMEZONE` on every request so the returned
+    "datetime" values are pre-localized to that zone (see the NOTE at the
+    top of this file) — this is what makes the Daily Trade Guarantee's
+    FORCE_HOUR/FORCE_MINUTE and day-boundary checks correct for Cambodia
+    (or whatever FORCE_TIMEZONE is set to) regardless of the underlying
+    exchange feed's own timezone.
     """
     if not TWELVE_DATA_API_KEYS:
         raise RuntimeError("No Twelve Data API key configured. Set TWELVE_DATA_API_KEY_1 (and optionally _2 / _3).")
@@ -213,6 +235,7 @@ def fetch_candles(interval, outputsize=200, credits_per_call=3):
             "outputsize": outputsize,
             "apikey": key,
             "order": "ASC",
+            "timezone": FORCE_TIMEZONE,
         }
         try:
             r = requests.get(url, params=params, timeout=15)
@@ -243,8 +266,9 @@ def fetch_candles(interval, outputsize=200, credits_per_call=3):
 
         last_error = data
         if not rate_limited:
-            # A non-rate-limit error (bad symbol, bad interval, etc.) will
-            # fail the same way on every key, so don't bother rotating.
+            # A non-rate-limit error (bad symbol, bad interval, bad
+            # timezone name, etc.) will fail the same way on every key, so
+            # don't bother rotating.
             break
         # else: rate-limited -> loop continues and tries the next key
 
@@ -363,7 +387,7 @@ DEFAULT_STATE = {
         "best_trade": None, "worst_trade": None,
     },
     # --- Daily Trade Guarantee tracking (mirrors tradedToday / forceAttemptedTdy) ---
-    "current_day": None,       # "YYYY-MM-DD" of the last bar we processed
+    "current_day": None,       # "YYYY-MM-DD" of the last bar we processed, in FORCE_TIMEZONE
     "traded_today": False,     # flips true the instant ANY trade (organic or forced) opens
     "force_attempted_today": False,  # true once we've made our one forced-entry attempt today
 }
@@ -636,7 +660,8 @@ def open_position(side, entry, sl, tp1, tp2, tp3, bar_time):
 # ---------------------- DAILY TRADE GUARANTEE HELPERS ----------------------
 def roll_daily_guarantee_state(state, bar_dt):
     """Mirrors the indicator's `newDay` reset block: whenever the bar's
-    calendar day changes vs. the last bar we processed, reset
+    calendar day (in FORCE_TIMEZONE, since bar_dt comes pre-localized from
+    fetch_candles) changes vs. the last bar we processed, reset
     traded_today / force_attempted_today for the new day."""
     day_str = bar_dt.strftime("%Y-%m-%d")
     if state.get("current_day") != day_str:
@@ -655,6 +680,10 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
                           and flat
       forceDirection   = entry-TF Supertrend, else HTF Supertrend,
                           else EMA position (always resolves to +-1)
+
+    bar_dt is already localized to FORCE_TIMEZONE (Twelve Data's `timezone`
+    param does this at fetch time), so bar_dt.hour/bar_dt.minute here mean
+    "9:00" = 9:00am in FORCE_TIMEZONE, not exchange time.
 
     Returns (force_entry_now: bool, force_direction: int [1 or -1]).
     """
@@ -701,7 +730,9 @@ def check():
     result = {"bar_time": bar_time, "event": None}
 
     # 0) Roll the Daily Trade Guarantee's day-tracking forward if this bar
-    #    is a new calendar day (mirrors the indicator's `newDay` reset).
+    #    is a new calendar day IN FORCE_TIMEZONE (mirrors the indicator's
+    #    `newDay` reset, now anchored to Cambodia/FORCE_TIMEZONE rather than
+    #    the raw exchange feed timezone).
     roll_daily_guarantee_state(state, last["datetime"])
 
     # 1) Manage an already-open position against this bar's high/low
@@ -794,7 +825,7 @@ def check():
                 f"TP3: {tp3:.2f}\n"
                 f"Supertrend ({TIMEFRAME}): {trend_arrow(last['st_dir'])}\n"
                 f"{htf_line}"
-                f"Bar: {bar_time}"
+                f"Bar: {bar_time} ({FORCE_TIMEZONE})"
             )
             send_telegram(msg)
             result["event"] = "entry"
@@ -830,6 +861,7 @@ def stats():
             "enabled": GUARANTEE_DAILY_TRADE,
             "force_hour": FORCE_HOUR,
             "force_minute": FORCE_MINUTE,
+            "force_timezone": FORCE_TIMEZONE,
             "current_day": state.get("current_day"),
             "traded_today": state.get("traded_today"),
             "force_attempted_today": state.get("force_attempted_today"),
@@ -861,7 +893,7 @@ def test_signal():
         f"TP1: {tp1:.2f}\n"
         f"TP2: {tp2:.2f}\n"
         f"TP3: {tp3:.2f}\n"
-        f"Bar: {last['datetime']}\n"
+        f"Bar: {last['datetime']} ({FORCE_TIMEZONE})\n"
         f"(This is a forced test message, not a real signal)"
     )
     send_telegram(msg)
@@ -892,6 +924,7 @@ def health():
         "guarantee_daily_trade": GUARANTEE_DAILY_TRADE,
         "force_hour": FORCE_HOUR,
         "force_minute": FORCE_MINUTE,
+        "force_timezone": FORCE_TIMEZONE,
     })
 
 

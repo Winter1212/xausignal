@@ -117,16 +117,18 @@ FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Bangkok")
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
-FAST_LEN = 12
-SLOW_LEN = 35
+# Pine inputs: fastLen=9, slowLen=21, useRSI=true, rsiLen=14, rsiOB=70, rsiOS=30
+FAST_LEN = 9
+SLOW_LEN = 21
 USE_RSI = True
-RSI_LEN = 15
+RSI_LEN = 14
 RSI_OB = 70   # block buys above this
 RSI_OS = 30   # block sells below this
 
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
-ST_ATR_PERIOD = 15
-ST_FACTOR = 5
+# Pine inputs: stAtrPeriod=10, stFactor=3.0
+ST_ATR_PERIOD = 10
+ST_FACTOR = 3.0
 # Require a Supertrend flip to hold this many bars before it's tradeable
 # (matches indicator's "stConfirmBars" input, default 2).
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
@@ -138,7 +140,7 @@ ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
 USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
 # Twelve Data interval strings, NOT Pine's "60" minute-count style.
 # Indicator default is "60" minutes -> Twelve Data equivalent is "1h".
-HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "4h")
+HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "1h")
 HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 10))
 HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 3.0))
 
@@ -154,11 +156,12 @@ FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))    # 0-23, in FORCE_TIMEZONE
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
 
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
-ATR_LEN = 12
-SL_MULT = 1
+# Pine inputs: atrLen=14, slMult=1.5, slMinPts=10, slMaxPts=12, rr1=1.0, rr2=2.0, rr3=3.0
+ATR_LEN = 14
+SL_MULT = 1.5
 SL_MIN_PTS = 10.0
-SL_MAX_PTS = 10.0
-RR1, RR2, RR3 = 1.8, 2.8, 3.5
+SL_MAX_PTS = 12.0
+RR1, RR2, RR3 = 1.0, 2.0, 3.0
 
 TP1_CLOSE_PCT = 50          # % of ORIGINAL position closed at TP1 (Partial mode only)
 TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (Partial mode only)

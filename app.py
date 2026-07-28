@@ -1,82 +1,3 @@
-"""
-Gold Signal Terminal — Free polling bot (no TradingView subscription needed)
-
-This is a 1:1 re-implementation of the Pine Script v6 indicator
-"Gold Signal Terminal — Entry/SL/TP1-3 + Winrate + Supertrend", INCLUDING:
-
-  - 9/21 EMA crossover entries
-  - RSI(14) filter (blocks buys above 70, sells below 30)
-  - Supertrend(10, 3.0) trend filter on the entry timeframe — a signal only
-    fires WITH the Supertrend direction
-  - Supertrend "flip confirmation" — a fresh flip must hold for
-    ST_CONFIRM_BARS bars before it's allowed to trigger a trade. This is
-    what stops the bot from entering on the exact bar of a flip that then
-    immediately reverses back (classic whipsaw).
-  - Higher-timeframe Supertrend confirmation — BUY signals additionally
-    require the HTF Supertrend to be bullish, SELL signals require it to be
-    bearish. This is the fix for "overall trend is up, a small pullback
-    flips the entry-TF Supertrend, we short, and get stopped as price
-    resumes up." Costs one extra API call per poll (see CONFIG below).
-  - Daily Trade Guarantee — mirrors the indicator's "Daily Trade Guarantee"
-    group. If no organic BUY/SELL has opened a trade yet today by the
-    configured Force-Entry Hour/Minute, the bot forces one entry in the
-    direction of the prevailing trend (entry-TF Supertrend, falling back to
-    HTF Supertrend, falling back to EMA position) so every day gets at
-    least one trade. Forced entries are tagged "(Forced Daily)" everywhere
-    (Telegram message + trade log) so you can evaluate/disable them
-    separately from organic "(Supertrend)" signals. Exactly like the
-    indicator, this does NOT loosen the organic filters — it's a
-    separately-tagged fallback that only fires when the day would
-    otherwise end with zero trades.
-  - ATR(14) x 1.5 stop distance, clamped into a fixed [10, 12] point band
-  - TP1 = 1R, TP2 = 2R, TP3 = 3R
-  - Stop loss NEVER moves to breakeven. It stays fixed at its original
-    level for the life of the trade. The ONLY thing that can move it is the
-    optional "trail runner with Supertrend after TP2" behavior, which only
-    ever ratchets the stop in the trade's favor.
-  - Three selectable Position/P&L modes, exactly matching the indicator:
-      "partial"   -> Partial Closes (Cascade TP1 -> TP2 -> TP3)  [default]
-      "tp1_only"  -> Full Size @ TP1 Only
-      "first_hit" -> Full Size @ Whichever TP Hit First
-
-Unlike the indicator (which only draws on a chart), this bot tracks an OPEN
-POSITION across polls (in state.json) and sends a Telegram alert for every
-event: entry, TP1 partial, TP2 partial, runner trail stop, and final close.
-
-Data source: Twelve Data free API (https://twelvedata.com — free signup, no card required)
-Alerts: sent directly to Telegram via the Bot API
-
-Deploy as a Render free Web Service. Since Render free web services sleep
-when idle, use a free external pinger (e.g. https://cron-job.org) to hit the
-/check endpoint every 5 minutes (or however often TIMEFRAME closes) to keep
-it awake and checked on schedule.
-
-NOTE ON API CREDIT USAGE: enabling USE_HTF (on by default, matching the
-indicator's default) means every /check call fetches TWO timeframes instead
-of one — your entry timeframe AND the higher timeframe. This roughly
-doubles Twelve Data credit consumption per poll. If you're tight on free-tier
-credits, either set USE_HTF=false or add more keys via
-TWELVE_DATA_API_KEY_2 / _3.
-
-NOTE ON THE DAILY TRADE GUARANTEE AND TIME ZONES: every call to Twelve
-Data's time_series endpoint below passes a `timezone` parameter
-(FORCE_TIMEZONE, default "Asia/Bangkok" — same UTC+7 offset as Cambodia,
-and more consistently supported by Twelve Data's timezone list than
-"Asia/Phnom_Penh"). That makes Twelve Data return each bar's "datetime"
-value ALREADY LOCALIZED to that zone, rather than in the exchange's raw
-timezone. FORCE_HOUR / FORCE_MINUTE are then compared directly against
-that localized timestamp, so "9:00" means 9:00am in FORCE_TIMEZONE
-regardless of what timezone the underlying exchange feed uses. If you want
-a different session's local time instead of Cambodia, just change
-FORCE_TIMEZONE to another IANA zone (e.g. "America/New_York",
-"Europe/London") — every downstream calculation (day-of-week/day boundary,
-force-entry check) follows automatically since it's all derived from the
-same localized "datetime" column. Also note (same caveat as the indicator):
-if TIMEFRAME is a daily-or-higher bar, every bar's hour/minute will be the
-same value (typically 00:00), so set FORCE_HOUR/FORCE_MINUTE to 0/0 in that
-case or just use this bot on an intraday timeframe.
-"""
-
 import os
 import json
 import requests
@@ -109,10 +30,11 @@ SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
 # IANA timezone Twelve Data localizes every bar's "datetime" value into
-# (see the big NOTE at the top of this file). Default is Cambodia's
-# UTC+7 offset via "Asia/Bangkok". This drives the Daily Trade Guarantee's
-# day-boundary AND its FORCE_HOUR/FORCE_MINUTE check below.
-FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Bangkok")
+# (see the big NOTE at the top of this file). Default matches the
+# indicator's "Force-Entry Timezone" input default ("Asia/Phnom_Penh",
+# Cambodia, UTC+7). This drives the Daily Trade Guarantee's day-boundary
+# AND its FORCE_HOUR/FORCE_MINUTE check below.
+FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
@@ -127,7 +49,7 @@ RSI_OS = 30   # block sells below this
 
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
 # Pine inputs: stAtrPeriod=10, stFactor=3.0
-ST_ATR_PERIOD = 1
+ST_ATR_PERIOD = 15
 ST_FACTOR = 5.0
 # Require a Supertrend flip to hold this many bars before it's tradeable
 # (matches indicator's "stConfirmBars" input, default 2).

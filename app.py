@@ -2,7 +2,7 @@ import os
 import json
 import requests
 import pandas as pd
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
@@ -89,7 +89,7 @@ TP1_CLOSE_PCT = 50          # % of ORIGINAL position closed at TP1 (Partial mode
 TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (Partial mode only)
 
 # "partial" | "tp1_only" | "first_hit"  (matches the indicator's pnlMode dropdown)
-PNL_MODE = os.environ.get("PNL_MODE", "partial")
+PNL_MODE = os.environ.get("PNL_MODE", "tp1_only")
 
 # ---------------------- RUNNER MANAGEMENT (exact indicator default) ----------------------
 USE_TRAILING_RUNNER = True  # trail SL to Supertrend after TP1+TP2 booked (Partial mode only)
@@ -340,6 +340,83 @@ def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
     return resp.json()
+
+
+def _notify_requested():
+    """True when the caller asked for the result to also be pushed to
+    Telegram, e.g. GET /check?notify=1 or GET /stats?notify=true."""
+    val = request.args.get("notify", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def _fmt_price(v):
+    return f"{v:.2f}" if isinstance(v, (int, float)) else "—"
+
+
+def _fmt_money(v):
+    if v is None:
+        return "—"
+    return f"{'+' if v >= 0 else ''}{v:.2f}"
+
+
+def build_check_telegram_message(result, state):
+    """Builds a '[Manual Check]' summary for the dashboard's 'send to
+    Telegram' toggle on /check. This is DELIBERATELY separate from the
+    automatic entry/exit alerts fired inside manage_position()/the entry
+    block above, so a manual dashboard check never gets confused with a
+    real automated signal — it's always clearly tagged."""
+    lines = ["📊 [Manual Check] XAUUSD", f"Bar: {result.get('bar_time')} ({FORCE_TIMEZONE})"]
+
+    event = result.get("event")
+    if event == "entry":
+        lines.append(f"Result: NEW {result.get('side')} signal opened this check {'(Forced Daily)' if result.get('forced') else '(Supertrend)'}.")
+    elif event == "position_update":
+        lines.append("Result: open position was updated this check (TP/SL/trail — see the alert above).")
+    else:
+        lines.append("Result: no new signal on this bar.")
+
+    pos = state.get("position")
+    if pos:
+        side = "BUY" if pos["dir"] == 1 else "SELL"
+        lines.append(
+            f"Open position: {side} @ {_fmt_price(pos['entry'])} | "
+            f"SL {_fmt_price(pos['sl'])} | TP1 {_fmt_price(pos['tp1'])} "
+            f"TP2 {_fmt_price(pos['tp2'])} TP3 {_fmt_price(pos['tp3'])} | "
+            f"remaining {round(pos['remaining_size'] * 100)}%"
+        )
+    else:
+        lines.append("No open position.")
+
+    return "\n".join(lines)
+
+
+def build_stats_telegram_message(payload, state):
+    """Builds a '[Manual Stats]' summary for the dashboard's 'send to
+    Telegram' toggle on /stats."""
+    lines = [
+        "📈 [Manual Stats] XAUUSD Bot",
+        f"Win rate: {payload['win_rate']}% ({payload['wins']}W / {payload['losses']}L / {payload['total_trades']} total)",
+        f"Net P&L: {_fmt_money(payload['net_pnl'])}",
+        f"Best trade: {_fmt_money(payload['best_trade'])} | Worst trade: {_fmt_money(payload['worst_trade'])}",
+    ]
+
+    pos = payload.get("position")
+    if pos:
+        side = "BUY" if pos["dir"] == 1 else "SELL"
+        lines.append(
+            f"Open position: {side} @ {_fmt_price(pos['entry'])} | SL {_fmt_price(pos['sl'])}"
+        )
+    else:
+        lines.append("No open position.")
+
+    dg = payload["daily_guarantee"]
+    lines.append(
+        f"Daily guarantee: {'ON' if dg['enabled'] else 'OFF'} @ "
+        f"{dg['force_hour']:02d}:{dg['force_minute']:02d} {dg['force_timezone']} | "
+        f"traded today: {'yes' if dg['traded_today'] else 'no'}"
+    )
+
+    return "\n".join(lines)
 
 
 # ---------------------- TRADE LOG ----------------------
@@ -757,6 +834,11 @@ def check():
             result["side"] = side
             result["forced"] = is_forced
             result["message"] = msg
+            result["entry"] = entry
+            result["sl"] = sl
+            result["tp1"] = tp1
+            result["tp2"] = tp2
+            result["tp3"] = tp3
         elif force_entry_now:
             # Force-entry time passed, but direction resolution somehow
             # produced neither (shouldn't happen since forceDirection always
@@ -766,6 +848,16 @@ def check():
 
         save_state(state)
 
+    # Reload state fresh so the "position" snapshot in the Telegram summary
+    # (and the JSON response, for the dashboard) reflects everything that
+    # just happened above.
+    state = load_state()
+    result["position"] = state.get("position")
+
+    if _notify_requested():
+        send_telegram(build_check_telegram_message(result, state))
+        result["telegram_notified"] = True
+
     return jsonify(result)
 
 
@@ -774,7 +866,7 @@ def stats():
     state = load_state()
     s = state["stats"]
     win_rate = (s["wins"] / s["total_trades"] * 100) if s["total_trades"] else 0
-    return jsonify({
+    payload = {
         "position": state["position"],
         "win_rate": round(win_rate, 1),
         "total_trades": s["total_trades"],
@@ -791,7 +883,13 @@ def stats():
             "traded_today": state.get("traded_today"),
             "force_attempted_today": state.get("force_attempted_today"),
         },
-    })
+    }
+
+    if _notify_requested():
+        send_telegram(build_stats_telegram_message(payload, state))
+        payload["telegram_notified"] = True
+
+    return jsonify(payload)
 
 
 @app.route("/test", methods=["GET"])
@@ -850,7 +948,395 @@ def health():
         "force_hour": FORCE_HOUR,
         "force_minute": FORCE_MINUTE,
         "force_timezone": FORCE_TIMEZONE,
+        "dashboard": "/dashboard",
     })
+
+
+# ---------------------- DASHBOARD UI ----------------------
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>XAUUSD Signal Desk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0b0e11;
+    --surface:#12161c;
+    --surface-2:#181e26;
+    --border:#242b34;
+    --gold:#d4af6a;
+    --gold-dim:#8a7346;
+    --gold-glow:rgba(212,175,106,.16);
+    --buy:#3fbf7f;
+    --buy-glow:rgba(63,191,127,.14);
+    --sell:#e0574c;
+    --sell-glow:rgba(224,87,76,.14);
+    --text:#eef1f5;
+    --text-dim:#8b93a1;
+    --text-faint:#5b6472;
+    --mono:'JetBrains Mono',monospace;
+    --sans:'Inter',sans-serif;
+    --display:'Space Grotesk',sans-serif;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:
+      radial-gradient(circle at 12% -10%, rgba(212,175,106,.10), transparent 45%),
+      radial-gradient(circle at 100% 0%, rgba(63,191,127,.06), transparent 40%),
+      var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    min-height:100vh;
+    padding:28px 18px 60px;
+  }
+  .wrap{max-width:920px;margin:0 auto;}
+
+  /* ---- Header / ticker ---- */
+  header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+  .brand{display:flex;align-items:center;gap:12px;}
+  .brand .mark{
+    width:38px;height:38px;border-radius:10px;
+    background:linear-gradient(155deg, var(--gold), #a7823f);
+    display:flex;align-items:center;justify-content:center;
+    font-family:var(--display);font-weight:700;color:#0b0e11;font-size:15px;
+    box-shadow:0 0 0 1px rgba(212,175,106,.35), 0 8px 20px -6px rgba(212,175,106,.5);
+  }
+  .brand h1{font-family:var(--display);font-size:19px;margin:0;font-weight:600;letter-spacing:.2px;}
+  .brand .sub{font-family:var(--mono);font-size:11px;color:var(--text-faint);letter-spacing:.4px;text-transform:uppercase;}
+  .live-pill{
+    display:flex;align-items:center;gap:7px;
+    font-family:var(--mono);font-size:11.5px;color:var(--text-dim);
+    background:var(--surface);border:1px solid var(--border);
+    padding:7px 12px;border-radius:100px;
+  }
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--buy);box-shadow:0 0 0 3px var(--buy-glow);animation:pulse 2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
+
+  /* ---- Candlestick divider (signature element) ---- */
+  .divider{display:flex;align-items:flex-end;gap:3px;height:34px;margin:22px 0 26px;opacity:.9;}
+  .divider .bar{flex:1;max-width:9px;border-radius:2px 2px 0 0;background:var(--border);}
+  .divider .bar.up{background:linear-gradient(180deg, var(--buy), transparent);}
+  .divider .bar.down{background:linear-gradient(180deg, var(--sell), transparent);}
+  .divider .bar.gold{background:linear-gradient(180deg, var(--gold), transparent);}
+
+  /* ---- Action cards ---- */
+  .actions{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+  @media (max-width:600px){.actions{grid-template-columns:1fr;}}
+  .card{
+    background:linear-gradient(180deg, var(--surface), var(--surface-2));
+    border:1px solid var(--border);border-radius:14px;padding:20px;
+    display:flex;flex-direction:column;gap:14px;
+  }
+  .card h2{font-family:var(--display);font-size:15px;margin:0;font-weight:600;}
+  .card p.desc{margin:0;font-size:12.5px;color:var(--text-dim);line-height:1.5;}
+  .toggle-row{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .toggle-label{font-size:12.5px;color:var(--text-dim);display:flex;align-items:center;gap:7px;}
+  .toggle-label svg{width:14px;height:14px;opacity:.8;}
+  .switch{position:relative;width:38px;height:22px;flex:none;}
+  .switch input{opacity:0;width:0;height:0;}
+  .slider{position:absolute;inset:0;background:#252b34;border-radius:20px;cursor:pointer;transition:.2s;border:1px solid var(--border);}
+  .slider::before{content:"";position:absolute;width:16px;height:16px;left:2px;top:2px;background:var(--text-faint);border-radius:50%;transition:.2s;}
+  .switch input:checked + .slider{background:var(--gold-glow);border-color:var(--gold-dim);}
+  .switch input:checked + .slider::before{transform:translateX(16px);background:var(--gold);}
+  button.run{
+    margin-top:auto;
+    background:var(--gold);color:#141008;border:none;border-radius:9px;
+    font-family:var(--sans);font-weight:600;font-size:13.5px;
+    padding:11px 16px;cursor:pointer;transition:.15s;
+    display:flex;align-items:center;justify-content:center;gap:8px;
+  }
+  button.run:hover{filter:brightness(1.08);transform:translateY(-1px);}
+  button.run:active{transform:translateY(0);}
+  button.run:disabled{opacity:.55;cursor:progress;transform:none;}
+  button.run.secondary{background:transparent;border:1px solid var(--gold-dim);color:var(--gold);}
+  .spinner{width:13px;height:13px;border-radius:50%;border:2px solid rgba(20,16,8,.35);border-top-color:#141008;animation:spin .7s linear infinite;display:none;}
+  button.run.loading .spinner{display:inline-block;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  /* ---- Results panel ---- */
+  .results{margin-top:20px;}
+  .empty{
+    border:1px dashed var(--border);border-radius:14px;padding:32px 20px;
+    text-align:center;color:var(--text-faint);font-size:13px;font-family:var(--mono);
+  }
+  .panel{
+    background:var(--surface);border:1px solid var(--border);border-radius:14px;
+    overflow:hidden;
+  }
+  .panel-head{
+    display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+    padding:14px 18px;border-bottom:1px solid var(--border);background:var(--surface-2);
+  }
+  .panel-head .title{font-family:var(--display);font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:9px;}
+  .badge{
+    font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.4px;
+    padding:3px 9px;border-radius:100px;text-transform:uppercase;
+  }
+  .badge.buy{background:var(--buy-glow);color:var(--buy);}
+  .badge.sell{background:var(--sell-glow);color:var(--sell);}
+  .badge.neutral{background:var(--gold-glow);color:var(--gold);}
+  .badge.muted{background:#20262e;color:var(--text-faint);}
+  .timestamp{font-family:var(--mono);font-size:11px;color:var(--text-faint);}
+
+  .panel-body{padding:18px;}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}
+  @media (max-width:560px){.grid4{grid-template-columns:repeat(2,1fr);}}
+  .stat-box{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px;}
+  .stat-box .k{font-size:10.5px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px;}
+  .stat-box .v{font-family:var(--mono);font-size:16px;font-weight:600;}
+  .v.pos{color:var(--buy);} .v.neg{color:var(--sell);} .v.gold{color:var(--gold);}
+
+  .kv{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:12.5px;}
+  .kv:last-child{border-bottom:none;}
+  .kv .k{color:var(--text-dim);}
+  .kv .v{font-family:var(--mono);font-weight:600;}
+
+  table{width:100%;border-collapse:collapse;margin-top:6px;font-size:12px;}
+  thead th{
+    text-align:left;color:var(--text-faint);font-weight:500;font-size:10.5px;
+    text-transform:uppercase;letter-spacing:.3px;padding:6px 8px;border-bottom:1px solid var(--border);
+  }
+  tbody td{padding:8px;border-bottom:1px solid var(--border);font-family:var(--mono);}
+  tbody tr:last-child td{border-bottom:none;}
+  .side-tag{font-weight:700;font-size:11px;}
+  .side-tag.buy{color:var(--buy);} .side-tag.sell{color:var(--sell);}
+  .scroll-x{overflow-x:auto;}
+
+  .section-label{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-faint);margin:18px 0 8px;font-family:var(--mono);}
+  .error-box{background:var(--sell-glow);border:1px solid rgba(224,87,76,.3);color:#ff9d95;padding:12px 16px;border-radius:10px;font-size:12.5px;font-family:var(--mono);}
+
+  footer{text-align:center;margin-top:34px;font-size:11px;color:var(--text-faint);font-family:var(--mono);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <div class="mark">Au</div>
+      <div>
+        <h1>XAUUSD Signal Desk</h1>
+        <div class="sub">Supertrend + EMA/RSI engine</div>
+      </div>
+    </div>
+    <div class="live-pill"><span class="dot"></span> engine online</div>
+  </header>
+
+  <div class="divider" id="divider"></div>
+
+  <div class="actions">
+    <div class="card">
+      <h2>Run Check</h2>
+      <p class="desc">Pulls the latest bar, evaluates entry/exit conditions and updates any open position.</p>
+      <div class="toggle-row">
+        <span class="toggle-label">Send result to Telegram</span>
+        <label class="switch"><input type="checkbox" id="notifyCheck"><span class="slider"></span></label>
+      </div>
+      <button class="run" id="btnCheck" onclick="runCheck()">
+        <span class="spinner"></span><span class="label">Run Check</span>
+      </button>
+    </div>
+
+    <div class="card">
+      <h2>Get Stats</h2>
+      <p class="desc">Win rate, net P&amp;L, open position and the daily-trade-guarantee status.</p>
+      <div class="toggle-row">
+        <span class="toggle-label">Send result to Telegram</span>
+        <label class="switch"><input type="checkbox" id="notifyStats"><span class="slider"></span></label>
+      </div>
+      <button class="run secondary" id="btnStats" onclick="runStats()">
+        <span class="spinner"></span><span class="label">Get Stats</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="results" id="results">
+    <div class="empty">Run a check or pull stats to see live output here.</div>
+  </div>
+
+  <footer>state persists server-side · times shown in bot's FORCE_TIMEZONE</footer>
+</div>
+
+<script>
+function buildDivider(){
+  const el = document.getElementById('divider');
+  const pattern = ['gold','up','up','down','up','down','down','up','gold','up','down','up','up','gold','down','up','down','up','gold','up'];
+  el.innerHTML = pattern.map((cls,i)=>{
+    const h = 8 + Math.round(Math.sin(i*1.3)*8 + 14);
+    return `<div class="bar ${cls}" style="height:${h}px"></div>`;
+  }).join('');
+}
+buildDivider();
+
+function setLoading(btn, loading){
+  btn.disabled = loading;
+  btn.classList.toggle('loading', loading);
+}
+
+function fmtMoney(v){
+  if(v === null || v === undefined) return '—';
+  const s = v >= 0 ? '+' : '';
+  return `${s}$${Number(v).toFixed(2)}`;
+}
+function fmtPrice(v){
+  if(v === null || v === undefined) return '—';
+  return Number(v).toFixed(2);
+}
+function esc(s){
+  return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+}
+
+async function runCheck(){
+  const btn = document.getElementById('btnCheck');
+  const notify = document.getElementById('notifyCheck').checked;
+  setLoading(btn, true);
+  try{
+    const res = await fetch(`/check?notify=${notify ? 1 : 0}`);
+    const data = await res.json();
+    if(!res.ok){ renderError(data.error || 'Request failed'); return; }
+    renderCheck(data);
+  }catch(e){
+    renderError('Could not reach the server: ' + e.message);
+  }finally{
+    setLoading(btn, false);
+  }
+}
+
+async function runStats(){
+  const btn = document.getElementById('btnStats');
+  const notify = document.getElementById('notifyStats').checked;
+  setLoading(btn, true);
+  try{
+    const res = await fetch(`/stats?notify=${notify ? 1 : 0}`);
+    const data = await res.json();
+    if(!res.ok){ renderError(data.error || 'Request failed'); return; }
+    renderStats(data);
+  }catch(e){
+    renderError('Could not reach the server: ' + e.message);
+  }finally{
+    setLoading(btn, false);
+  }
+}
+
+function renderError(msg){
+  document.getElementById('results').innerHTML = `<div class="error-box">⚠ ${esc(msg)}</div>`;
+}
+
+function eventBadge(event){
+  if(event === 'entry') return `<span class="badge neutral">New Entry</span>`;
+  if(event === 'position_update') return `<span class="badge muted">Position Updated</span>`;
+  return `<span class="badge muted">No Signal</span>`;
+}
+
+function positionKv(pos){
+  if(!pos) return `<div class="kv"><span class="k">Open position</span><span class="v">None</span></div>`;
+  const side = pos.dir === 1 ? 'BUY' : 'SELL';
+  const sideClass = pos.dir === 1 ? 'buy' : 'sell';
+  return `
+    <div class="kv"><span class="k">Side</span><span class="v side-tag ${sideClass}">${side}</span></div>
+    <div class="kv"><span class="k">Entry</span><span class="v">${fmtPrice(pos.entry)}</span></div>
+    <div class="kv"><span class="k">Stop Loss</span><span class="v">${fmtPrice(pos.sl)}</span></div>
+    <div class="kv"><span class="k">TP1 / TP2 / TP3</span><span class="v">${fmtPrice(pos.tp1)} / ${fmtPrice(pos.tp2)} / ${fmtPrice(pos.tp3)}</span></div>
+    <div class="kv"><span class="k">Remaining size</span><span class="v">${Math.round(pos.remaining_size*100)}%</span></div>
+  `;
+}
+
+function renderCheck(data){
+  const notifiedBadge = data.telegram_notified ? `<span class="badge neutral">Sent to Telegram</span>` : '';
+  let entryBlock = '';
+  if(data.event === 'entry'){
+    const sideClass = data.side === 'BUY' ? 'buy' : 'sell';
+    entryBlock = `
+      <div class="section-label">New Signal</div>
+      <div class="grid4">
+        <div class="stat-box"><div class="k">Side</div><div class="v side-tag ${sideClass}">${data.side}${data.forced ? ' ⚡' : ''}</div></div>
+        <div class="stat-box"><div class="k">Entry</div><div class="v gold">${fmtPrice(data.entry)}</div></div>
+        <div class="stat-box"><div class="k">Stop Loss</div><div class="v neg">${fmtPrice(data.sl)}</div></div>
+        <div class="stat-box"><div class="k">Take Profits</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp1)} · ${fmtPrice(data.tp2)} · ${fmtPrice(data.tp3)}</div></div>
+      </div>
+      ${data.forced ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">⚡ Opened by the Daily Trade Guarantee fallback, not the organic signal stack.</p>` : ''}
+    `;
+  }
+
+  document.getElementById('results').innerHTML = `
+    <div class="panel">
+      <div class="panel-head">
+        <div class="title">Check Result ${eventBadge(data.event)} ${notifiedBadge}</div>
+        <div class="timestamp">${esc(data.bar_time || '—')}</div>
+      </div>
+      <div class="panel-body">
+        ${entryBlock}
+        <div class="section-label">Current Position</div>
+        ${positionKv(data.position)}
+      </div>
+    </div>
+  `;
+}
+
+function renderStats(data){
+  const notifiedBadge = data.telegram_notified ? `<span class="badge neutral">Sent to Telegram</span>` : '';
+  const pnlClass = data.net_pnl > 0 ? 'pos' : (data.net_pnl < 0 ? 'neg' : '');
+  const rows = (data.recent_log || []).map(t => {
+    const sideClass = t.side === 'BUY' ? 'buy' : 'sell';
+    const pnlC = t.pnl > 0 ? 'pos' : (t.pnl < 0 ? 'neg' : '');
+    return `
+      <tr>
+        <td class="side-tag ${sideClass}">${esc(t.side)}</td>
+        <td>${fmtPrice(t.entry)}</td>
+        <td>${fmtPrice(t.exit)}</td>
+        <td>${esc(t.result)}</td>
+        <td class="${pnlC}">${fmtMoney(t.pnl)}</td>
+      </tr>
+    `;
+  }).join('') || `<tr><td colspan="5" style="color:var(--text-faint);text-align:center;">No trades logged yet</td></tr>`;
+
+  const dg = data.daily_guarantee || {};
+
+  document.getElementById('results').innerHTML = `
+    <div class="panel">
+      <div class="panel-head">
+        <div class="title">Performance ${notifiedBadge}</div>
+        <div class="timestamp">${dg.current_day || ''} · ${esc(dg.force_timezone || '')}</div>
+      </div>
+      <div class="panel-body">
+        <div class="grid4">
+          <div class="stat-box"><div class="k">Win Rate</div><div class="v gold">${data.win_rate}%</div></div>
+          <div class="stat-box"><div class="k">Record</div><div class="v">${data.wins}W – ${data.losses}L</div></div>
+          <div class="stat-box"><div class="k">Net P&amp;L</div><div class="v ${pnlClass}">${fmtMoney(data.net_pnl)}</div></div>
+          <div class="stat-box"><div class="k">Total Trades</div><div class="v">${data.total_trades}</div></div>
+        </div>
+
+        <div class="section-label">Current Position</div>
+        ${positionKv(data.position)}
+
+        <div class="section-label">Daily Trade Guarantee</div>
+        <div class="kv"><span class="k">Status</span><span class="v">${dg.enabled ? 'Enabled' : 'Disabled'} @ ${String(dg.force_hour).padStart(2,'0')}:${String(dg.force_minute).padStart(2,'0')}</span></div>
+        <div class="kv"><span class="k">Traded today</span><span class="v">${dg.traded_today ? 'Yes' : 'No'}</span></div>
+
+        <div class="section-label">Recent Trades</div>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Side</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&amp;L</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":

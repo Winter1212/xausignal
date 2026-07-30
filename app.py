@@ -39,7 +39,7 @@ FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
-# Pine inputs: fastLen=9, slowLen=21, useRSI=true, rsiLen=14, rsiOB=70, rsiOS=30
+# Pine inputs: fastLen=12, slowLen=35, useRSI=true, rsiLen=15, rsiOB=70, rsiOS=30
 FAST_LEN = 12
 SLOW_LEN = 35
 USE_RSI = True
@@ -48,9 +48,9 @@ RSI_OB = 70   # block buys above this
 RSI_OS = 30   # block sells below this
 
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
-# Pine inputs: stAtrPeriod=10, stFactor=3.0
-ST_ATR_PERIOD = 15
-ST_FACTOR = 5.0
+# Pine inputs: stAtrPeriod=15, stFactor=5.0
+ST_ATR_PERIOD = 5
+ST_FACTOR = 1.0
 # Require a Supertrend flip to hold this many bars before it's tradeable
 # (matches indicator's "stConfirmBars" input, default 2).
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
@@ -60,11 +60,36 @@ ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
 # BUY signals when the HTF Supertrend is bullish, only takes SELL signals
 # when it's bearish.
 USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
-# Twelve Data interval strings, NOT Pine's "60" minute-count style.
-# Indicator default is "60" minutes -> Twelve Data equivalent is "1h".
+# Twelve Data interval strings, NOT Pine's "240" minute-count style.
+# Indicator default is "240" minutes -> Twelve Data equivalent is "4h".
 HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "4h")
-HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 10))
-HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 3.0))
+HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 4))
+HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
+
+# ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION (exact indicator defaults) ----------------------
+# Mirrors the indicator's "Entry Timing (Pullback Confirmation)" group.
+# Instead of entering the instant the EMA cross + RSI + Supertrend + HTF
+# stack all agree ("the base condition"), that agreement only ARMS a
+# pending signal. The trade is only actually opened once price retraces
+# back within PULLBACK_MAX_ATR of the Fast EMA (while the trend filters
+# still agree), or the pending signal is dropped if it hasn't pulled back
+# within PULLBACK_TIMEOUT_BARS bars.
+#
+# Because this bot polls periodically (it doesn't walk bar-by-bar like the
+# Pine script does on a chart), the "armed" state has to be persisted in
+# state.json across polls, and re-anchored to the current bar's position in
+# the freshly-fetched candle window every time /check runs. See
+# roll_pullback_state() below.
+USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
+PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.2))
+PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 4))
+
+# Overextension filter: blocks ANY organic entry (pullback or immediate
+# mode) if price is currently too far from the Fast EMA in ATR terms —
+# the "already extended, about to mean-revert" state the indicator's
+# changelog calls out as the cause of its losing SELLs.
+USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
+MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
 
 # ---------------------- DAILY TRADE GUARANTEE (exact indicator defaults) ----------------------
 # Matches the indicator's "Daily Trade Guarantee" group. If nothing organic
@@ -72,13 +97,13 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 3.0))
 # FORCE_TIMEZONE, default Cambodia/UTC+7 — see NOTE at top of file), force
 # one entry in the direction of the prevailing trend so every day gets >= 1
 # trade. This is a SEPARATE, clearly-tagged fallback — it never loosens the
-# organic EMA/RSI/Supertrend/HTF stack above.
+# organic EMA/RSI/Supertrend/HTF/pullback/extension stack above.
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
 FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))    # 0-23, in FORCE_TIMEZONE (see NOTE above)
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
 
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
-# Pine inputs: atrLen=14, slMult=1.5, slMinPts=10, slMaxPts=12, rr1=1.0, rr2=2.0, rr3=3.0
+# Pine inputs: atrLen=12, slMult=1.0, slMinPts=10, slMaxPts=10, rr1=1.8, rr2=2.8, rr3=3.5
 ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
@@ -89,6 +114,9 @@ TP1_CLOSE_PCT = 50          # % of ORIGINAL position closed at TP1 (Partial mode
 TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (Partial mode only)
 
 # "partial" | "tp1_only" | "first_hit"  (matches the indicator's pnlMode dropdown)
+# Pine's default is "Partial Closes (Cascade TP1->TP2->TP3)" -> "partial".
+# (Previously this defaulted to "tp1_only" here, which did NOT match the
+# indicator's default behavior — fixed.)
 PNL_MODE = os.environ.get("PNL_MODE", "tp1_only")
 
 # ---------------------- RUNNER MANAGEMENT (exact indicator default) ----------------------
@@ -315,6 +343,9 @@ DEFAULT_STATE = {
     "current_day": None,       # "YYYY-MM-DD" of the last bar we processed, in FORCE_TIMEZONE
     "traded_today": False,     # flips true the instant ANY trade (organic or forced) opens
     "force_attempted_today": False,  # true once we've made our one forced-entry attempt today
+    # --- Pullback Confirmation tracking (mirrors pendingLong / pendingShort / pendingBar) ---
+    "pending_dir": None,        # 1 (armed long), -1 (armed short), or None
+    "pending_bar_time": None,   # datetime string of the bar that armed the pending signal
 }
 
 
@@ -373,7 +404,11 @@ def build_check_telegram_message(result, state):
     elif event == "position_update":
         lines.append("Result: open position was updated this check (TP/SL/trail — see the alert above).")
     else:
-        lines.append("Result: no new signal on this bar.")
+        pending = state.get("pending_dir")
+        if pending:
+            lines.append(f"Result: no new signal on this bar. Pending {'LONG' if pending == 1 else 'SHORT'} signal armed, waiting for pullback.")
+        else:
+            lines.append("Result: no new signal on this bar.")
 
     pos = state.get("position")
     if pos:
@@ -710,6 +745,58 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
     return force_entry_now, force_direction
 
 
+# ---------------------- ENTRY TIMING HELPERS (Pullback Confirmation) ----------------------
+def bars_since_pending_armed(df, pending_bar_time):
+    """
+    Finds the row in the freshly-fetched df matching the bar that armed the
+    pending signal, and returns how many bars have elapsed since then
+    (0 = armed on the current/last bar). If the armed bar has fallen out of
+    the fetched window (too old), returns a large number so the caller
+    treats it as timed out — mirrors what would happen on a real chart if
+    price never pulled back for that long.
+    """
+    if pending_bar_time is None:
+        return None
+    target = pd.to_datetime(pending_bar_time)
+    matches = df.index[df["datetime"] == target]
+    if len(matches) == 0:
+        return PULLBACK_TIMEOUT_BARS + 1
+    return (len(df) - 1) - matches[0]
+
+
+def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
+                         base_long_cond, base_short_cond):
+    """
+    Mirrors the indicator's pending-signal block:
+
+      if baseLongCond:  pendingLong := true,  pendingShort := false
+      if baseShortCond: pendingShort := true, pendingLong := false
+      if pendingLong  and (not stBullish or not htfBullish or timeout): pendingLong := false
+      if pendingShort and (not stBearish or not htfBearish or timeout): pendingShort := false
+
+    Mutates state["pending_dir"] / state["pending_bar_time"] in place.
+    """
+    if base_long_cond:
+        state["pending_dir"] = 1
+        state["pending_bar_time"] = bar_time
+    if base_short_cond:
+        state["pending_dir"] = -1
+        state["pending_bar_time"] = bar_time
+
+    bars_since = bars_since_pending_armed(df, state["pending_bar_time"])
+
+    if state["pending_dir"] == 1:
+        timed_out = bars_since is not None and bars_since > PULLBACK_TIMEOUT_BARS
+        if not st_bullish or not htf_bullish or timed_out:
+            state["pending_dir"] = None
+            state["pending_bar_time"] = None
+    elif state["pending_dir"] == -1:
+        timed_out = bars_since is not None and bars_since > PULLBACK_TIMEOUT_BARS
+        if not st_bearish or not htf_bearish or timed_out:
+            state["pending_dir"] = None
+            state["pending_bar_time"] = None
+
+
 # ---------------------- CORE CHECK ----------------------
 @app.route("/check", methods=["GET"])
 def check():
@@ -771,14 +858,42 @@ def check():
         htf_bullish = (not USE_HTF) or htf_dir == 1
         htf_bearish = (not USE_HTF) or htf_dir == -1
 
-        long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
-        short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
+        # --- Overextension filter (matches useExtensionFilter/extensionOk) ---
+        extension_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
+        extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
+
+        # --- Pullback distance (matches pullbackDistATR/pullbackOk) ---
+        pullback_dist_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
+        pullback_ok = pullback_dist_atr <= PULLBACK_MAX_ATR
+
+        # --- Base condition: the whole filter stack agrees (matches
+        #     baseLongCond / baseShortCond). This is what ARMS a pending
+        #     signal, and (in immediate mode) is also the entry condition. ---
+        base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
+        base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
+
+        # --- Arm / cancel the pending pullback signal (matches the
+        #     indicator's pendingLong/pendingShort block) ---
+        roll_pullback_state(
+            state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
+            base_long_cond, base_short_cond,
+        )
+
+        # --- Organic entry conditions (matches longCond/shortCond) ---
+        if USE_PULLBACK_ENTRY:
+            long_cond = (
+                extension_ok and state["pending_dir"] == 1 and pullback_ok
+                and st_bullish and htf_bullish and rsi_ok_long
+            )
+            short_cond = (
+                extension_ok and state["pending_dir"] == -1 and pullback_ok
+                and st_bearish and htf_bearish and rsi_ok_short
+            )
+        else:
+            long_cond = extension_ok and base_long_cond
+            short_cond = extension_ok and base_short_cond
 
         # --- Daily Trade Guarantee: forced fallback entry (matches forceEntryNow/forceDirection) ---
-        # NOTE: if USE_HTF is False, htf_dir stays 0 above; compute_force_entry
-        # still falls back to HTF Supertrend direction when the entry-TF
-        # Supertrend is flat, so it fetches HTF Supertrend direction only
-        # when USE_HTF already fetched it, otherwise falls through to EMA.
         force_entry_now, force_direction = compute_force_entry(
             state, last["datetime"], int(last["st_dir"]), htf_dir,
             last["emaFast"], last["emaSlow"],
@@ -790,6 +905,11 @@ def check():
         is_short_entry = short_cond or force_short_cond
 
         state["last_signal_bar"] = bar_time
+        result["pending"] = {
+            "dir": state["pending_dir"],
+            "extension_atr": round(extension_atr, 3),
+            "extension_ok": extension_ok,
+        }
 
         if is_long_entry or is_short_entry:
             entry = last["close"]
@@ -816,7 +936,13 @@ def check():
             state["traded_today"] = True
             state["force_attempted_today"] = True
 
-            tag = "(Forced Daily)" if is_forced else "(Supertrend)"
+            # Clear the pending signal on entry (matches the indicator
+            # setting pendingLong/pendingShort := false in both entry blocks).
+            state["pending_dir"] = None
+            state["pending_bar_time"] = None
+
+            is_pullback = USE_PULLBACK_ENTRY and not is_forced
+            tag = "(Forced Daily)" if is_forced else "(Supertrend, Pullback)" if is_pullback else "(Supertrend)"
             htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(htf_dir)}\n" if USE_HTF else ""
             msg = (
                 f"XAUUSD {side} signal {tag}\n"
@@ -833,6 +959,7 @@ def check():
             result["event"] = "entry"
             result["side"] = side
             result["forced"] = is_forced
+            result["pullback"] = is_pullback
             result["message"] = msg
             result["entry"] = entry
             result["sl"] = sl
@@ -882,6 +1009,10 @@ def stats():
             "current_day": state.get("current_day"),
             "traded_today": state.get("traded_today"),
             "force_attempted_today": state.get("force_attempted_today"),
+        },
+        "pending_signal": {
+            "dir": state.get("pending_dir"),
+            "armed_bar_time": state.get("pending_bar_time"),
         },
     }
 
@@ -944,6 +1075,12 @@ def health():
         "use_htf": USE_HTF,
         "htf_timeframe": HTF_TIMEFRAME if USE_HTF else None,
         "st_confirm_bars": ST_CONFIRM_BARS,
+        "use_pullback_entry": USE_PULLBACK_ENTRY,
+        "pullback_max_atr": PULLBACK_MAX_ATR,
+        "pullback_timeout_bars": PULLBACK_TIMEOUT_BARS,
+        "use_extension_filter": USE_EXTENSION_FILTER,
+        "max_extension_atr": MAX_EXTENSION_ATR,
+        "pnl_mode": PNL_MODE,
         "guarantee_daily_trade": GUARANTEE_DAILY_TRADE,
         "force_hour": FORCE_HOUR,
         "force_minute": FORCE_MINUTE,
@@ -1264,7 +1401,14 @@ function renderCheck(data){
         <div class="stat-box"><div class="k">Take Profits</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp1)} · ${fmtPrice(data.tp2)} · ${fmtPrice(data.tp3)}</div></div>
       </div>
       ${data.forced ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">⚡ Opened by the Daily Trade Guarantee fallback, not the organic signal stack.</p>` : ''}
+      ${data.pullback ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">↩ Opened after a pullback confirmation, not on the initial cross bar.</p>` : ''}
     `;
+  }
+
+  let pendingBlock = '';
+  if(data.event !== 'entry' && data.pending && data.pending.dir){
+    const dirLabel = data.pending.dir === 1 ? 'LONG' : 'SHORT';
+    pendingBlock = `<div class="kv"><span class="k">Pending signal</span><span class="v">${dirLabel} (waiting for pullback)</span></div>`;
   }
 
   document.getElementById('results').innerHTML = `
@@ -1275,6 +1419,7 @@ function renderCheck(data){
       </div>
       <div class="panel-body">
         ${entryBlock}
+        ${pendingBlock}
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}
       </div>
@@ -1300,6 +1445,7 @@ function renderStats(data){
   }).join('') || `<tr><td colspan="5" style="color:var(--text-faint);text-align:center;">No trades logged yet</td></tr>`;
 
   const dg = data.daily_guarantee || {};
+  const ps = data.pending_signal || {};
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
@@ -1317,6 +1463,9 @@ function renderStats(data){
 
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}
+
+        <div class="section-label">Pending Signal</div>
+        <div class="kv"><span class="k">Armed</span><span class="v">${ps.dir ? (ps.dir === 1 ? 'LONG (waiting for pullback)' : 'SHORT (waiting for pullback)') : 'None'}</span></div>
 
         <div class="section-label">Daily Trade Guarantee</div>
         <div class="kv"><span class="k">Status</span><span class="v">${dg.enabled ? 'Enabled' : 'Disabled'} @ ${String(dg.force_hour).padStart(2,'0')}:${String(dg.force_minute).padStart(2,'0')}</span></div>

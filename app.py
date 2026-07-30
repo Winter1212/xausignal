@@ -40,8 +40,8 @@ KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
 # Pine inputs: fastLen=12, slowLen=35, useRSI=true, rsiLen=15, rsiOB=70, rsiOS=30
-FAST_LEN = 12
-SLOW_LEN = 35
+FAST_LEN = 30
+SLOW_LEN = 32
 USE_RSI = True
 RSI_LEN = 15
 RSI_OB = 70   # block buys above this

@@ -33,8 +33,19 @@ TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart ti
 # (see the big NOTE at the top of this file). Default matches the
 # indicator's "Force-Entry Timezone" input default ("Asia/Phnom_Penh",
 # Cambodia, UTC+7). This drives the Daily Trade Guarantee's day-boundary
-# AND its FORCE_HOUR/FORCE_MINUTE check below.
+# AND its FORCE_HOUR/FORCE_MINUTE check below, AND (now) the weekend
+# no-new-signals guard below.
 FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
+
+# ---------------------- WEEKEND GUARD ----------------------
+# The market (XAU/USD spot) is closed over the weekend. When enabled (the
+# default), the bot will NOT open any NEW signal -- organic or forced by
+# the Daily Trade Guarantee -- while the current bar's calendar day (in
+# FORCE_TIMEZONE) is a Saturday or Sunday. It still manages/closes any
+# already-open position against incoming bars, in case your feed still
+# ticks over the weekend. Set DISABLE_WEEKEND_SIGNALS=false to turn this
+# off again.
+DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lower() == "true"
 
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
@@ -97,7 +108,8 @@ MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
 # FORCE_TIMEZONE, default Cambodia/UTC+7 — see NOTE at top of file), force
 # one entry in the direction of the prevailing trend so every day gets >= 1
 # trade. This is a SEPARATE, clearly-tagged fallback — it never loosens the
-# organic EMA/RSI/Supertrend/HTF/pullback/extension stack above.
+# organic EMA/RSI/Supertrend/HTF/pullback/extension stack above. It is also
+# subject to the weekend guard above, so it will not fire on Sat/Sun.
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
 FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))    # 0-23, in FORCE_TIMEZONE (see NOTE above)
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
@@ -329,6 +341,15 @@ def trend_arrow(d):
     return "▲" if d == 1 else "▼" if d == -1 else "→"
 
 
+def is_weekend_bar(bar_dt):
+    """
+    True when bar_dt (already localized to FORCE_TIMEZONE by fetch_candles'
+    timezone= param) falls on a Saturday or Sunday. pandas/Python weekday()
+    is 0=Monday ... 5=Saturday, 6=Sunday.
+    """
+    return bar_dt.weekday() >= 5
+
+
 # ---------------------- STATE ----------------------
 DEFAULT_STATE = {
     "last_signal_bar": None,
@@ -403,6 +424,8 @@ def build_check_telegram_message(result, state):
         lines.append(f"Result: NEW {result.get('side')} signal opened this check {'(Forced Daily)' if result.get('forced') else '(Supertrend)'}.")
     elif event == "position_update":
         lines.append("Result: open position was updated this check (TP/SL/trail — see the alert above).")
+    elif result.get("weekend_skipped"):
+        lines.append("Result: weekend — new-signal checks skipped (existing position, if any, still managed).")
     else:
         pending = state.get("pending_dir")
         if pending:
@@ -714,7 +737,7 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
       isPastForceTime = (hour*60+minute) >= (forceHour*60+forceMinute)
       forceEntryNow    = guaranteeDailyTrade and isPastForceTime
                           and not forceAttemptedTdy and not tradedToday
-                          and flat
+                          and flat and not weekend
       forceDirection   = entry-TF Supertrend, else HTF Supertrend,
                           else EMA position (always resolves to +-1)
 
@@ -725,6 +748,9 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
     Returns (force_entry_now: bool, force_direction: int [1 or -1]).
     """
     if not GUARANTEE_DAILY_TRADE:
+        return False, 0
+
+    if DISABLE_WEEKEND_SIGNALS and is_weekend_bar(bar_dt):
         return False, 0
 
     is_past_force_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HOUR * 60 + FORCE_MINUTE)
@@ -824,7 +850,10 @@ def check():
     #    the raw exchange feed timezone).
     roll_daily_guarantee_state(state, last["datetime"])
 
-    # 1) Manage an already-open position against this bar's high/low
+    # 1) Manage an already-open position against this bar's high/low.
+    #    This still runs on weekends -- if a position is open going into
+    #    the weekend we keep tracking SL/TP against whatever the feed
+    #    reports, we just won't OPEN anything new below.
     if state["position"] is not None and state.get("last_exit_bar") != bar_time:
         acted = manage_position(state, last, last["st"])
         state["last_exit_bar"] = bar_time
@@ -832,8 +861,19 @@ def check():
             result["event"] = "position_update"
         save_state(state)
 
-    # 2) Only look for a NEW entry if we're currently flat
-    if state["position"] is None and state.get("last_signal_bar") != bar_time:
+    # 1b) Weekend guard: don't evaluate/open any NEW signal (organic or
+    #     forced) while the current bar is a Saturday/Sunday in
+    #     FORCE_TIMEZONE. Still update last_signal_bar so we don't just
+    #     spin re-checking the same closed bar all weekend.
+    weekend_now = DISABLE_WEEKEND_SIGNALS and is_weekend_bar(last["datetime"])
+    if weekend_now:
+        state["last_signal_bar"] = bar_time
+        result["weekend_skipped"] = True
+        save_state(state)
+
+    # 2) Only look for a NEW entry if we're currently flat, it's not a bar
+    #    we've already processed, and it's not the weekend.
+    if (not weekend_now) and state["position"] is None and state.get("last_signal_bar") != bar_time:
         prev = df.iloc[-2]
 
         ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and last["emaFast"] > last["emaSlow"]
@@ -1014,6 +1054,9 @@ def stats():
             "dir": state.get("pending_dir"),
             "armed_bar_time": state.get("pending_bar_time"),
         },
+        "weekend_guard": {
+            "enabled": DISABLE_WEEKEND_SIGNALS,
+        },
     }
 
     if _notify_requested():
@@ -1085,6 +1128,7 @@ def health():
         "force_hour": FORCE_HOUR,
         "force_minute": FORCE_MINUTE,
         "force_timezone": FORCE_TIMEZONE,
+        "disable_weekend_signals": DISABLE_WEEKEND_SIGNALS,
         "dashboard": "/dashboard",
     })
 
@@ -1368,9 +1412,10 @@ function renderError(msg){
   document.getElementById('results').innerHTML = `<div class="error-box">⚠ ${esc(msg)}</div>`;
 }
 
-function eventBadge(event){
+function eventBadge(event, weekendSkipped){
   if(event === 'entry') return `<span class="badge neutral">New Entry</span>`;
   if(event === 'position_update') return `<span class="badge muted">Position Updated</span>`;
+  if(weekendSkipped) return `<span class="badge muted">Weekend — Skipped</span>`;
   return `<span class="badge muted">No Signal</span>`;
 }
 
@@ -1411,14 +1456,20 @@ function renderCheck(data){
     pendingBlock = `<div class="kv"><span class="k">Pending signal</span><span class="v">${dirLabel} (waiting for pullback)</span></div>`;
   }
 
+  let weekendBlock = '';
+  if(data.weekend_skipped){
+    weekendBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">🌙 Weekend — new-signal checks are paused. Any open position is still tracked.</p>`;
+  }
+
   document.getElementById('results').innerHTML = `
     <div class="panel">
       <div class="panel-head">
-        <div class="title">Check Result ${eventBadge(data.event)} ${notifiedBadge}</div>
+        <div class="title">Check Result ${eventBadge(data.event, data.weekend_skipped)} ${notifiedBadge}</div>
         <div class="timestamp">${esc(data.bar_time || '—')}</div>
       </div>
       <div class="panel-body">
         ${entryBlock}
+        ${weekendBlock}
         ${pendingBlock}
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}

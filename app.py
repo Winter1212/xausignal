@@ -120,7 +120,7 @@ ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3 = 1.8, 2.8, 3.5
+RR1, RR2, RR3 = 1.9, 2.8, 3.5
 
 TP1_CLOSE_PCT = 50          # % of ORIGINAL position closed at TP1 (Partial mode only)
 TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (Partial mode only)
@@ -864,10 +864,21 @@ def check():
     # 1b) Weekend guard: don't evaluate/open any NEW signal (organic or
     #     forced) while the current bar is a Saturday/Sunday in
     #     FORCE_TIMEZONE. Still update last_signal_bar so we don't just
-    #     spin re-checking the same closed bar all weekend.
+    #     spin re-checking the same closed bar all weekend. Also
+    #     explicitly clears any pending pullback signal that was armed
+    #     before the weekend started -- this mirrors the indicator's
+    #     "weekendBlocked" cancellation of pendingLong/pendingShort, so a
+    #     signal armed Friday afternoon can never silently fire on the
+    #     Sunday-night/Monday-open bar. Without this it would simply have
+    #     been *frozen* (never re-evaluated) and left to expire on its own
+    #     via the pullback timeout once Monday's bar was processed, which
+    #     usually resolves the same way but wasn't a guaranteed match.
     weekend_now = DISABLE_WEEKEND_SIGNALS and is_weekend_bar(last["datetime"])
     if weekend_now:
         state["last_signal_bar"] = bar_time
+        if state.get("pending_dir") is not None:
+            state["pending_dir"] = None
+            state["pending_bar_time"] = None
         result["weekend_skipped"] = True
         save_state(state)
 

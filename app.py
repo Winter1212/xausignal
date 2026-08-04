@@ -29,7 +29,7 @@ TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
-# IANA timezone Twelve Data localizes every bar's "datetime" value into
+
 # (see the big NOTE at the top of this file). Default matches the
 # indicator's "Force-Entry Timezone" input default ("Asia/Phnom_Penh",
 # Cambodia, UTC+7). This drives the Daily Trade Guarantee's day-boundary

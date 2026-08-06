@@ -12,7 +12,7 @@ app = Flask(__name__)
 # to 3x the daily credit budget of a single free-tier key. You can also set
 # just TWELVE_DATA_API_KEY_1 alone if you only have one key. Falls back to
 # the legacy single-var TWELVE_DATA_API_KEY if none of the numbered vars
-# are set.
+
 _raw_keys = [
     os.environ.get("TWELVE_DATA_API_KEY_1", ""),
     os.environ.get("TWELVE_DATA_API_KEY_2", ""),

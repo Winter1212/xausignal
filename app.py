@@ -51,7 +51,7 @@ KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
 # Pine inputs: fastLen=12, slowLen=35, useRSI=true, rsiLen=15, rsiOB=70, rsiOS=30
-FAST_LEN = 30
+FAST_LEN = 27
 SLOW_LEN = 32
 USE_RSI = True
 RSI_LEN = 15
@@ -60,11 +60,11 @@ RSI_OS = 30   # block sells below this
 
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
 # Pine inputs: stAtrPeriod=15, stFactor=5.0
-ST_ATR_PERIOD = 5
-ST_FACTOR = 1.0
+ST_ATR_PERIOD = 8
+ST_FACTOR = 2.0
 # Require a Supertrend flip to hold this many bars before it's tradeable
 # (matches indicator's "stConfirmBars" input, default 2).
-ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 2))
+ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
 
 # ---------------------- HIGHER TIMEFRAME CONFIRMATION (exact indicator defaults) ----------------------
 # Matches the indicator's "Higher Timeframe Confirmation" group. Only takes

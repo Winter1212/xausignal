@@ -9,7 +9,7 @@ app = Flask(__name__)
 # ---------------------- CONFIG (env vars, set these in Render) ----------------------
 # Multi-key rotation: set up to 3 separate Twelve Data API keys
 # (TWELVE_DATA_API_KEY_1/2/3) to spread requests across accounts and get up
-# to 3x the daily credit budget of a single free-tier key. You can also set
+# to 3x the daily credit budget of a single free-tier key. You can also se
 # just TWELVE_DATA_API_KEY_1 alone if you only have one key. Falls back to
 # the legacy single-var TWELVE_DATA_API_KEY if none of the numbered vars
 

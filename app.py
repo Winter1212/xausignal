@@ -129,7 +129,7 @@ TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (P
 # Pine's default is "Partial Closes (Cascade TP1->TP2->TP3)" -> "partial".
 # (Previously this defaulted to "tp1_only" here, which did NOT match the
 # indicator's default behavior — fixed.)
-PNL_MODE = os.environ.get("PNL_MODE", "tp1_only")
+PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
 # ---------------------- RUNNER MANAGEMENT (exact indicator default) ----------------------
 USE_TRAILING_RUNNER = True  # trail SL to Supertrend after TP1+TP2 booked (Partial mode only)

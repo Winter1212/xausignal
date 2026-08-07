@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 import pandas as pd
 from flask import Flask, jsonify, request, Response
@@ -28,6 +29,23 @@ TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
+
+# ---------------------- WAKE-UP WEBHOOK (Tasker / IFTTT) ----------------------
+# Fired (in addition to the normal Telegram alert) whenever a NEW trade
+# signal actually opens a position -- i.e. real "wake up, there's a trade"
+# moments, not every /check poll. Point this at:
+#   - a Tasker "HTTP Request" event (via AutoRemote's public URL), or
+#   - an IFTTT Webhooks "Receive a web request" URL
+#     (https://maker.ifttt.com/trigger/<event>/with/key/<key>)
+# Leave WAKE_WEBHOOK_URL empty to disable this entirely.
+WAKE_WEBHOOK_URL    = os.environ.get("WAKE_WEBHOOK_URL", "")
+WAKE_WEBHOOK_METHOD = os.environ.get("WAKE_WEBHOOK_METHOD", "POST").upper()  # "POST" or "GET"
+# How many times to re-fire the webhook (with a short delay between) so a
+# Tasker alarm task has multiple chances to land / so a single missed
+# notification doesn't mean you sleep through the signal. Set to 1 to fire
+# once only.
+WAKE_WEBHOOK_RETRIES       = int(os.environ.get("WAKE_WEBHOOK_RETRIES", 3))
+WAKE_WEBHOOK_RETRY_SECONDS = float(os.environ.get("WAKE_WEBHOOK_RETRY_SECONDS", 5))
 
 
 # (see the big NOTE at the top of this file). Default matches the
@@ -398,6 +416,50 @@ def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
     return resp.json()
+
+
+# ---------------------- WAKE-UP WEBHOOK (Tasker / IFTTT) ----------------------
+def trigger_wake_webhook(side=None, entry=None, bar_time=None, forced=False):
+    """
+    Fires WAKE_WEBHOOK_URL so a phone-side automation (Tasker task via
+    AutoRemote, or an IFTTT Webhooks applet) can set off a loud alarm /
+    ring the phone. Fired only on a genuine NEW entry (see call site in
+    /check), never on every poll.
+
+    Retries WAKE_WEBHOOK_RETRIES times with a short gap so a single dropped
+    request (phone offline for a second, flaky mobile data, etc.) doesn't
+    silently mean the alarm never lands. Every attempt is logged to the
+    console; failures never raise, since a broken alarm hook must not take
+    down /check or block the trade signal itself.
+    """
+    if not WAKE_WEBHOOK_URL:
+        return {"skipped": "WAKE_WEBHOOK_URL not set"}
+
+    payload = {
+        "value1": side or "",
+        "value2": f"{entry:.2f}" if isinstance(entry, (int, float)) else "",
+        "value3": bar_time or "",
+        "side": side,
+        "entry": entry,
+        "bar_time": bar_time,
+        "forced": forced,
+    }
+
+    results = []
+    attempts = max(1, WAKE_WEBHOOK_RETRIES)
+    for i in range(attempts):
+        try:
+            if WAKE_WEBHOOK_METHOD == "GET":
+                resp = requests.get(WAKE_WEBHOOK_URL, params=payload, timeout=10)
+            else:
+                resp = requests.post(WAKE_WEBHOOK_URL, json=payload, timeout=10)
+            results.append(resp.status_code)
+        except Exception as e:
+            results.append(f"error: {e}")
+        if i < attempts - 1 and WAKE_WEBHOOK_RETRY_SECONDS > 0:
+            time.sleep(WAKE_WEBHOOK_RETRY_SECONDS)
+
+    return {"attempts": results}
 
 
 def _notify_requested():
@@ -1037,6 +1099,15 @@ def check():
                 f"Bar: {bar_time} ({FORCE_TIMEZONE})"
             )
             send_telegram(msg)
+
+            # --- Wake-up webhook: fire ONLY on a genuine new entry, so you
+            #     get physically alerted (Tasker alarm / IFTTT) for real
+            #     tradeable signals, not on every routine /check poll. ---
+            wake_result = trigger_wake_webhook(
+                side=side, entry=entry, bar_time=bar_time, forced=is_forced,
+            )
+            result["wake_webhook"] = wake_result
+
             result["event"] = "entry"
             result["side"] = side
             result["forced"] = is_forced
@@ -1138,6 +1209,17 @@ def test_signal():
     return jsonify({"status": "test message sent", "message": msg})
 
 
+@app.route("/test-wake", methods=["GET"])
+def test_wake():
+    """Fires the wake-up webhook right now with dummy data, WITHOUT sending
+    a Telegram message or touching state.json. Use this to verify your
+    Tasker/IFTTT setup end-to-end before relying on it while you sleep."""
+    if not WAKE_WEBHOOK_URL:
+        return jsonify({"error": "WAKE_WEBHOOK_URL is not set"}), 400
+    result = trigger_wake_webhook(side="BUY", entry=1234.56, bar_time="TEST", forced=False)
+    return jsonify({"status": "wake webhook fired", "result": result})
+
+
 @app.route("/keys", methods=["GET"])
 def keys_status():
     """Shows how many keys are configured, rotation position, and today's
@@ -1170,6 +1252,7 @@ def health():
         "force_minute": FORCE_MINUTE,
         "force_timezone": FORCE_TIMEZONE,
         "disable_weekend_signals": DISABLE_WEEKEND_SIGNALS,
+        "wake_webhook_configured": bool(WAKE_WEBHOOK_URL),
         "dashboard": "/dashboard",
     })
 

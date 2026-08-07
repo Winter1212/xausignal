@@ -29,6 +29,32 @@ TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
+# ---------------------- PUSHCUT (wake-up alert) ----------------------
+# Pushcut (https://pushcut.io) lets a webhook fire a notification on your
+# phone that can bypass Do Not Disturb / silent mode and even run a
+# Shortcuts automation (e.g. "start an alarm sound", "set volume to max")
+# -- which a normal Telegram push can't reliably do while you're asleep.
+#
+# Setup (one-time, on your phone):
+#   1. Install the free Pushcut app (iOS) -> Settings -> copy your API key.
+#   2. In Pushcut, create a Notification (Notifications tab -> "+"). Name
+#      it anything, e.g. "Trading Signal". Under that notification's
+#      settings, set Sound to something loud/looping, turn ON
+#      "Critical Alert" / "Time Sensitive" if available, and (optional but
+#      recommended for actually waking you up) add an Action that runs a
+#      Shortcut which plays a loud sound or starts an alarm.
+#   3. Set env vars below to match: PUSHCUT_API_KEY = your API key,
+#      PUSHCUT_NOTIFICATION_NAME = the exact notification name you created
+#      (defaults to "Trading Signal" if not set).
+#
+# If PUSHCUT_API_KEY is left blank, this feature is simply skipped -- the
+# bot behaves exactly as before (Telegram only).
+PUSHCUT_API_KEY = os.environ.get("PUSHCUT_API_KEY", "")
+PUSHCUT_NOTIFICATION_NAME = os.environ.get("PUSHCUT_NOTIFICATION_NAME", "Trading Signal")
+# Also fire Pushcut on SL/TP exit events, not just new entries. Default on,
+# since "SL hit while asleep" is just as worth waking up for as an entry.
+PUSHCUT_ON_EXITS = os.environ.get("PUSHCUT_ON_EXITS", "true").lower() == "true"
+
 
 # (see the big NOTE at the top of this file). Default matches the
 # indicator's "Force-Entry Timezone" input default ("Asia/Phnom_Penh",
@@ -400,6 +426,41 @@ def send_telegram(text):
     return resp.json()
 
 
+# ---------------------- PUSHCUT (wake-up alert) ----------------------
+def send_pushcut(title, text):
+    """
+    Fires a Pushcut notification. Unlike a plain Telegram push, a Pushcut
+    notification (once you've set the matching Notification in the Pushcut
+    app to use a loud/critical sound, or to trigger a Shortcuts automation
+    that plays a sound / sets volume) can actually wake you up.
+
+    Silently does nothing if PUSHCUT_API_KEY isn't set, so this is fully
+    optional and never breaks the bot if you don't configure it.
+    """
+    if not PUSHCUT_API_KEY:
+        return None
+    url = f"https://api.pushcut.io/v1/notifications/{PUSHCUT_NOTIFICATION_NAME}"
+    headers = {"API-Key": PUSHCUT_API_KEY}
+    payload = {"title": title, "text": text}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def notify_all(title, text):
+    """Sends the same alert to both Telegram (full message, unchanged
+    behavior) and Pushcut (short title/text, only if configured). Use this
+    instead of calling send_telegram() directly for anything that should
+    also be able to wake you up."""
+    send_telegram(text)
+    send_pushcut(title, text)
+
+
 def _notify_requested():
     """True when the caller asked for the result to also be pushed to
     Telegram, e.g. GET /check?notify=1 or GET /stats?notify=true."""
@@ -732,7 +793,13 @@ def manage_position(state, last_candle, st_value):
             f"Price: {price:.2f}\n"
             f"P&L (this leg): {'+' if pnl >= 0 else ''}${pnl:.2f}"
         )
+        # Regular exit alerts still always go to Telegram. Pushcut (the
+        # wake-you-up channel) is only fired for exits too when
+        # PUSHCUT_ON_EXITS is enabled (default on) -- an SL hit at 3am is
+        # just as worth waking up for as a fresh entry signal.
         send_telegram(msg)
+        if PUSHCUT_ON_EXITS:
+            send_pushcut(f"XAUUSD {side} — {label}", f"Price {price:.2f} | P&L {'+' if pnl >= 0 else ''}${pnl:.2f}")
 
     return len(events) > 0
 
@@ -1036,7 +1103,15 @@ def check():
                 f"{htf_line}"
                 f"Bar: {bar_time} ({FORCE_TIMEZONE})"
             )
+            # This is the key "wake me up" moment -- a brand new signal.
+            # Send the full message to Telegram as before, AND fire a
+            # Pushcut alert (short title + text) so a properly-configured
+            # Pushcut notification on your phone can sound an alarm.
             send_telegram(msg)
+            send_pushcut(
+                f"XAUUSD {side} SIGNAL {'⚡' if is_forced else ''}".strip(),
+                f"Entry {entry:.2f} | SL {sl:.2f} | TP1 {tp1:.2f} {tag}",
+            )
             result["event"] = "entry"
             result["side"] = side
             result["forced"] = is_forced
@@ -1135,7 +1210,13 @@ def test_signal():
         f"(This is a forced test message, not a real signal)"
     )
     send_telegram(msg)
-    return jsonify({"status": "test message sent", "message": msg})
+    pushcut_result = send_pushcut("XAUUSD TEST SIGNAL", f"Entry {entry:.2f} | SL {sl:.2f} | TP1 {tp1:.2f}")
+    return jsonify({
+        "status": "test message sent",
+        "message": msg,
+        "pushcut_configured": bool(PUSHCUT_API_KEY),
+        "pushcut_result": pushcut_result,
+    })
 
 
 @app.route("/keys", methods=["GET"])
@@ -1170,6 +1251,9 @@ def health():
         "force_minute": FORCE_MINUTE,
         "force_timezone": FORCE_TIMEZONE,
         "disable_weekend_signals": DISABLE_WEEKEND_SIGNALS,
+        "pushcut_configured": bool(PUSHCUT_API_KEY),
+        "pushcut_notification_name": PUSHCUT_NOTIFICATION_NAME if PUSHCUT_API_KEY else None,
+        "pushcut_on_exits": PUSHCUT_ON_EXITS,
         "dashboard": "/dashboard",
     })
 

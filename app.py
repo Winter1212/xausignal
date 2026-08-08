@@ -50,7 +50,7 @@ DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lowe
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
-# Pine inputs: fastLen=12, slowLen=35, useRSI=true, rsiLen=15, rsiOB=70, rsiOS=30
+# Pine inputs: fastLen=27, slowLen=32, useRSI=true, rsiLen=15, rsiOB=70, rsiOS=30
 FAST_LEN = 27
 SLOW_LEN = 32
 USE_RSI = True
@@ -59,11 +59,11 @@ RSI_OB = 70   # block buys above this
 RSI_OS = 30   # block sells below this
 
 # ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
-# Pine inputs: stAtrPeriod=15, stFactor=5.0
+# Pine inputs: stAtrPeriod=8, stFactor=2.0
 ST_ATR_PERIOD = 8
 ST_FACTOR = 2.0
 # Require a Supertrend flip to hold this many bars before it's tradeable
-# (matches indicator's "stConfirmBars" input, default 2).
+# (matches indicator's "stConfirmBars" input, default 1).
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
 
 # ---------------------- HIGHER TIMEFRAME CONFIRMATION (exact indicator defaults) ----------------------
@@ -115,30 +115,29 @@ FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))    # 0-23, in FORCE_TIMEZONE
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
 
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
-# Pine inputs: atrLen=12, slMult=1.0, slMinPts=10, slMaxPts=10, rr1=1.8, rr2=2.8, rr3=3.5
+# Pine inputs: atrLen=12, slMult=1.0, slMinPts=10, slMaxPts=10,
+#              rr1=1.9, rr2=2.7, rr3=3.5, rr4=4.0
 ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3 = 1.9, 2.8, 3.5
+RR1, RR2, RR3, RR4 = 1.9, 3.0, 4.0, 4.0
 
-TP1_CLOSE_PCT = 50          # % of ORIGINAL position closed at TP1 (Partial mode only)
-TP2_CUMULATIVE_PCT = 75     # cumulative % of ORIGINAL position closed by TP2 (Partial mode only)
-
-# "partial" | "tp1_only" | "first_hit"  (matches the indicator's pnlMode dropdown)
-# Pine's default is "Partial Closes (Cascade TP1->TP2->TP3)" -> "partial".
-# (Previously this defaulted to "tp1_only" here, which did NOT match the
-# indicator's default behavior — fixed.)
+# "tp1_only" | "first_hit" | "partial"  (matches the indicator's pnlMode dropdown)
+# Pine's default is "Ratchet SL (Book Once: BE -> TP1 -> TP2 -> TP4)" -> "partial"
+# here (the name "partial" is legacy — nothing is actually partially closed,
+# see the big note on partial_close_tp1/2/3 below).
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
 # ---------------------- RUNNER MANAGEMENT ----------------------
-# NOTE: as of the TP1/TP2/TP3 fixed-payout + manual SL-ladder change below,
-# the runner leg (after TP1+TP2 are booked) no longer trails the SL to the
-# live Supertrend value. Instead the SL sits fixed at TP1 (moved there when
-# TP2 was booked) until TP3 is hit, at which point the whole position is
-# closed. USE_TRAILING_RUNNER / trail_runner_sl() are kept in the file for
-# reference but are no longer called anywhere in manage_position().
-USE_TRAILING_RUNNER = True  # no longer used by the partial-mode runner leg (see note above)
+# NOTE: as of the TP1/TP2/TP3/TP4 fixed-payout + manual SL-ladder change
+# below, the runner leg (after TP1+TP2+TP3 are booked) no longer trails the
+# SL to the live Supertrend value. Instead the SL sits fixed at TP2 (moved
+# there when TP3 was booked) until TP4 is hit, at which point the whole
+# position is closed. USE_TRAILING_RUNNER / trail_runner_sl() are kept in
+# the file for reference but are no longer called anywhere in
+# manage_position().
+USE_TRAILING_RUNNER = True  # no longer used by the runner leg (see note above)
 
 # ---------------------- POSITION SIZING (exact indicator defaults) ----------------------
 LOT_SIZE = float(os.environ.get("LOT_SIZE", 0.01))
@@ -445,7 +444,8 @@ def build_check_telegram_message(result, state):
         lines.append(
             f"Open position: {side} @ {_fmt_price(pos['entry'])} | "
             f"SL {_fmt_price(pos['sl'])} | TP1 {_fmt_price(pos['tp1'])} "
-            f"TP2 {_fmt_price(pos['tp2'])} TP3 {_fmt_price(pos['tp3'])} | "
+            f"TP2 {_fmt_price(pos['tp2'])} TP3 {_fmt_price(pos['tp3'])} "
+            f"TP4 {_fmt_price(pos['tp4'])} | "
             f"remaining {round(pos['remaining_size'] * 100)}%"
         )
     else:
@@ -484,10 +484,10 @@ def build_stats_telegram_message(payload, state):
 
 
 # ---------------------- TRADE LOG ----------------------
-def log_trade(state, side, entry, sl, tp1, tp2, tp3, exit_price, result, points, pnl):
+def log_trade(state, side, entry, sl, tp1, tp2, tp3, tp4, exit_price, result, points, pnl):
     state["history"].insert(0, {
         "side": side, "entry": entry, "sl": sl,
-        "tp1": tp1, "tp2": tp2, "tp3": tp3, "exit": exit_price,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "exit": exit_price,
         "result": result, "points": round(points, 2), "pnl": round(pnl, 2),
     })
     state["history"] = state["history"][:50]
@@ -497,25 +497,25 @@ def log_trade(state, side, entry, sl, tp1, tp2, tp3, exit_price, result, points,
 def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
     """Fully closes whatever size remains and settles win/loss stats.
     A trade counts as a win overall if this final leg was positive, OR if an
-    earlier TP1/TP2 partial already locked in profit — same rule as the
+    earlier TP1/TP2/TP3 ratchet already locked in profit — same rule as the
     indicator's closeTrade().
 
     pnl_override: when provided, this exact dollar amount is booked for this
-    leg instead of deriving it from pos['remaining_size']. Used by the TP3 /
-    final-leg exit so it books its full configured dollar value (see the
-    TP1/TP2/TP3 fixed-payout ladder introduced below) rather than a
+    leg instead of deriving it from pos['remaining_size']. Used by the
+    TP4 / final-leg exit so it books its full configured dollar value (see
+    the TP1/TP2/TP3/TP4 fixed-payout ladder introduced below) rather than a
     fraction of the original position size.
     """
     points = (exit_price - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - exit_price)
     pnl = pnl_override if pnl_override is not None else points * LOT_SIZE * pos["remaining_size"] * UNITS_PER_LOT
 
     log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
-              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"],
+              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
               exit_price, result_label, points, pnl)
 
     stats = state["stats"]
     stats["total_trades"] += 1
-    combined_positive = pnl > 0 or pos["tp1_hit"] or pos["tp2_hit"]
+    combined_positive = pnl > 0 or pos["tp1_hit"] or pos["tp2_hit"] or pos["tp3_hit"]
     if combined_positive:
         stats["wins"] += 1
     else:
@@ -529,52 +529,69 @@ def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
 
 def partial_close_tp1(state, pos):
     """TP1 hit: books the FULL configured TP1 dollar value (points *
-    LOT_SIZE * UNITS_PER_LOT), NOT scaled down by TP1_CLOSE_PCT — e.g. with
-    RR1=1.9 and a 10pt SL, this books $19 regardless of TP1_CLOSE_PCT.
-    TP1_CLOSE_PCT is still used to track how much of the original size is
-    considered "remaining" for bookkeeping/display purposes.
-    Then moves the SL to breakeven (entry) so the rest of the trade can
-    never turn into an overall loss."""
+    LOT_SIZE * UNITS_PER_LOT) — e.g. with RR1=1.9 and a 10pt SL, this books
+    $19. Then moves the SL to breakeven (entry) so the rest of the trade
+    can never turn into an overall loss.
+
+    NOTE: nothing is actually partially closed anymore — the position
+    stays at full size the whole time. This just logs the TP1-level profit
+    as a bookkeeping row and ratchets the stop. The name/remaining_size
+    field is kept only for the dashboard's "remaining size" display."""
     points = (pos["tp1"] - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - pos["tp1"])
     pnl = points * LOT_SIZE * UNITS_PER_LOT
 
     log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
-              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"],
+              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
               pos["tp1"], f"TP1 Hit (+${pnl:.2f}, SL->Entry)", points, pnl)
 
     pos["tp1_hit"] = True
-    pos["remaining_size"] = round(1.0 - (TP1_CLOSE_PCT / 100.0), 6)
+    pos["remaining_size"] = 0.75
     pos["sl"] = pos["entry"]
     return pnl
 
 
 def partial_close_tp2(state, pos):
     """TP2 hit: books the FULL configured TP2 dollar value (points *
-    LOT_SIZE * UNITS_PER_LOT), NOT scaled down by remaining size — e.g.
-    with RR2=2.8 and a 10pt SL, this books $28.
-    Then moves the SL up to TP1 so the final runner leg can only exit at
-    TP1-or-better or TP3."""
-    target_remaining = 1.0 - (TP2_CUMULATIVE_PCT / 100.0)
+    LOT_SIZE * UNITS_PER_LOT) — e.g. with RR2=2.7 and a 10pt SL, this books
+    $27. Then moves the SL up to TP1 so the trade can only exit at
+    TP1-or-better from here."""
     points = (pos["tp2"] - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - pos["tp2"])
     pnl = points * LOT_SIZE * UNITS_PER_LOT
 
     log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
-              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"],
+              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
               pos["tp2"], f"TP2 Hit (+${pnl:.2f}, SL->TP1)", points, pnl)
 
     pos["tp2_hit"] = True
-    pos["remaining_size"] = round(target_remaining, 6)
+    pos["remaining_size"] = 0.5
     pos["sl"] = pos["tp1"]
+    return pnl
+
+
+def partial_close_tp3(state, pos):
+    """TP3 hit: books the FULL configured TP3 dollar value (points *
+    LOT_SIZE * UNITS_PER_LOT) — e.g. with RR3=3.5 and a 10pt SL, this books
+    $35. Then moves the SL up to TP2 so the final runner leg can only exit
+    at TP2-or-better or TP4."""
+    points = (pos["tp3"] - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - pos["tp3"])
+    pnl = points * LOT_SIZE * UNITS_PER_LOT
+
+    log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
+              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
+              pos["tp3"], f"TP3 Hit (+${pnl:.2f}, SL->TP2)", points, pnl)
+
+    pos["tp3_hit"] = True
+    pos["remaining_size"] = 0.25
+    pos["sl"] = pos["tp2"]
     return pnl
 
 
 def trail_runner_sl(pos, st_value):
     """DEPRECATED / no longer called by manage_position(). Kept only for
     reference — previously trailed the runner's SL to the live Supertrend
-    value after TP1+TP2 were booked. The runner leg now uses a fixed SL
-    ladder (entry -> TP1 -> TP2 is NOT used; SL sits at TP1 until TP3)
-    instead of a Supertrend trail. See partial_close_tp1/partial_close_tp2
-    and the final-leg branch in manage_position()."""
+    value after TP1+TP2+TP3 were booked. The runner leg now uses a fixed
+    SL at TP2 instead of a Supertrend trail. See partial_close_tp1/2/3 and
+    the final-leg branch in manage_position()."""
     if st_value is None or pd.isna(st_value):
         return
     if pos["dir"] == 1 and st_value > pos["sl"]:
@@ -604,6 +621,9 @@ def manage_position(state, last_candle, st_value):
             if low <= pos["sl"]:
                 pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
                 events.append(("SL Hit", pos["sl"], pnl))
+            elif high >= pos["tp4"]:
+                pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Full Close)")
+                events.append(("TP4 Hit (Full Close)", pos["tp4"], pnl))
             elif high >= pos["tp3"]:
                 pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Full Close)")
                 events.append(("TP3 Hit (Full Close)", pos["tp3"], pnl))
@@ -613,14 +633,21 @@ def manage_position(state, last_candle, st_value):
             elif high >= pos["tp1"]:
                 pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
                 events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:  # partial
+        else:  # partial (== ratcheting SL, book once)
             if not pos["tp1_hit"]:
                 if low <= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
                     events.append(("SL Hit", pos["sl"], pnl))
+                elif high >= pos["tp4"]:
+                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap, Full Size)")
+                    events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
                 elif high >= pos["tp3"]:
-                    pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Gap)")
-                    events.append(("TP3 Hit (Gap)", pos["tp3"], pnl))
+                    p1 = partial_close_tp1(state, pos)
+                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
+                    p2 = partial_close_tp2(state, pos)
+                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    p3 = partial_close_tp3(state, pos)
+                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
                 elif high >= pos["tp2"]:
                     p1 = partial_close_tp1(state, pos)
                     events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
@@ -633,28 +660,45 @@ def manage_position(state, last_candle, st_value):
                 if low <= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven)")
                     events.append(("SL Hit (After TP1 — Breakeven)", pos["sl"], pnl))
+                elif high >= pos["tp4"]:
+                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
+                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif high >= pos["tp3"]:
-                    pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Gap)")
-                    events.append(("TP3 Hit (Gap)", pos["tp3"], pnl))
+                    p2 = partial_close_tp2(state, pos)
+                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    p3 = partial_close_tp3(state, pos)
+                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
                 elif high >= pos["tp2"]:
                     p2 = partial_close_tp2(state, pos)
                     events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
-            else:
-                # Final runner leg: SL is fixed at TP1 (set when TP2 was
-                # booked). No more Supertrend trailing — either SL is hit
-                # (locking in the TP1 amount for this leg) or TP3 is hit
-                # (booking the full TP3 dollar value), and the position is
-                # closed either way.
+            elif pos["tp2_hit"] and not pos["tp3_hit"]:
                 if low <= pos["sl"]:
-                    points = pos["sl"] - pos["entry"]
+                    points = pos["tp1"] - pos["entry"]
                     pnl = points * LOT_SIZE * UNITS_PER_LOT
                     settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2 — Locked at TP1)", pnl_override=pnl)
                     events.append(("SL Hit (After TP1+TP2 — Locked at TP1)", pos["sl"], pnl))
+                elif high >= pos["tp4"]:
+                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
+                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif high >= pos["tp3"]:
-                    points = pos["tp3"] - pos["entry"]
+                    p3 = partial_close_tp3(state, pos)
+                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+            else:
+                # Final runner leg: SL is fixed at TP2 (set when TP3 was
+                # booked). No more Supertrend trailing — either SL is hit
+                # (locking in the TP2 amount for this leg) or TP4 is hit
+                # (booking the full TP4 dollar value), and the position is
+                # closed either way.
+                if low <= pos["sl"]:
+                    points = pos["tp2"] - pos["entry"]
                     pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["tp3"], "TP3 Hit (Final Leg)", pnl_override=pnl)
-                    events.append(("TP3 Hit (Final Leg)", pos["tp3"], pnl))
+                    settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pnl_override=pnl)
+                    events.append(("SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pos["sl"], pnl))
+                elif high >= pos["tp4"]:
+                    points = pos["tp4"] - pos["entry"]
+                    pnl = points * LOT_SIZE * UNITS_PER_LOT
+                    settle_trade(state, pos, pos["tp4"], "TP4 Hit (Final Leg)", pnl_override=pnl)
+                    events.append(("TP4 Hit (Final Leg)", pos["tp4"], pnl))
 
     def sell_side():
         if PNL_MODE == "tp1_only":
@@ -668,6 +712,9 @@ def manage_position(state, last_candle, st_value):
             if high >= pos["sl"]:
                 pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
                 events.append(("SL Hit", pos["sl"], pnl))
+            elif low <= pos["tp4"]:
+                pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Full Close)")
+                events.append(("TP4 Hit (Full Close)", pos["tp4"], pnl))
             elif low <= pos["tp3"]:
                 pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Full Close)")
                 events.append(("TP3 Hit (Full Close)", pos["tp3"], pnl))
@@ -677,14 +724,21 @@ def manage_position(state, last_candle, st_value):
             elif low <= pos["tp1"]:
                 pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
                 events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:  # partial
+        else:  # partial (== ratcheting SL, book once)
             if not pos["tp1_hit"]:
                 if high >= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
                     events.append(("SL Hit", pos["sl"], pnl))
+                elif low <= pos["tp4"]:
+                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap, Full Size)")
+                    events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
                 elif low <= pos["tp3"]:
-                    pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Gap)")
-                    events.append(("TP3 Hit (Gap)", pos["tp3"], pnl))
+                    p1 = partial_close_tp1(state, pos)
+                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
+                    p2 = partial_close_tp2(state, pos)
+                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    p3 = partial_close_tp3(state, pos)
+                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
                 elif low <= pos["tp2"]:
                     p1 = partial_close_tp1(state, pos)
                     events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
@@ -697,28 +751,45 @@ def manage_position(state, last_candle, st_value):
                 if high >= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven)")
                     events.append(("SL Hit (After TP1 — Breakeven)", pos["sl"], pnl))
+                elif low <= pos["tp4"]:
+                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
+                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif low <= pos["tp3"]:
-                    pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Gap)")
-                    events.append(("TP3 Hit (Gap)", pos["tp3"], pnl))
+                    p2 = partial_close_tp2(state, pos)
+                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    p3 = partial_close_tp3(state, pos)
+                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
                 elif low <= pos["tp2"]:
                     p2 = partial_close_tp2(state, pos)
                     events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
-            else:
-                # Final runner leg: SL is fixed at TP1 (set when TP2 was
-                # booked). No more Supertrend trailing — either SL is hit
-                # (locking in the TP1 amount for this leg) or TP3 is hit
-                # (booking the full TP3 dollar value), and the position is
-                # closed either way.
+            elif pos["tp2_hit"] and not pos["tp3_hit"]:
                 if high >= pos["sl"]:
-                    points = pos["entry"] - pos["sl"]
+                    points = pos["entry"] - pos["tp1"]
                     pnl = points * LOT_SIZE * UNITS_PER_LOT
                     settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2 — Locked at TP1)", pnl_override=pnl)
                     events.append(("SL Hit (After TP1+TP2 — Locked at TP1)", pos["sl"], pnl))
+                elif low <= pos["tp4"]:
+                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
+                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif low <= pos["tp3"]:
-                    points = pos["entry"] - pos["tp3"]
+                    p3 = partial_close_tp3(state, pos)
+                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+            else:
+                # Final runner leg: SL is fixed at TP2 (set when TP3 was
+                # booked). No more Supertrend trailing — either SL is hit
+                # (locking in the TP2 amount for this leg) or TP4 is hit
+                # (booking the full TP4 dollar value), and the position is
+                # closed either way.
+                if high >= pos["sl"]:
+                    points = pos["entry"] - pos["tp2"]
                     pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["tp3"], "TP3 Hit (Final Leg)", pnl_override=pnl)
-                    events.append(("TP3 Hit (Final Leg)", pos["tp3"], pnl))
+                    settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pnl_override=pnl)
+                    events.append(("SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pos["sl"], pnl))
+                elif low <= pos["tp4"]:
+                    points = pos["entry"] - pos["tp4"]
+                    pnl = points * LOT_SIZE * UNITS_PER_LOT
+                    settle_trade(state, pos, pos["tp4"], "TP4 Hit (Final Leg)", pnl_override=pnl)
+                    events.append(("TP4 Hit (Final Leg)", pos["tp4"], pnl))
 
     if pos["dir"] == 1:
         buy_side()
@@ -737,12 +808,12 @@ def manage_position(state, last_candle, st_value):
     return len(events) > 0
 
 
-def open_position(side, entry, sl, tp1, tp2, tp3, bar_time):
+def open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time):
     return {
         "dir": 1 if side == "BUY" else -1,
-        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4,
         "entry_time": bar_time,
-        "tp1_hit": False, "tp2_hit": False,
+        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
         "remaining_size": 1.0,
     }
 
@@ -999,17 +1070,23 @@ def check():
             if is_long_entry:
                 sl = entry - sl_dist
                 risk = entry - sl
-                tp1, tp2, tp3 = entry + risk * RR1, entry + risk * RR2, entry + risk * RR3
+                tp1 = entry + risk * RR1
+                tp2 = entry + risk * RR2
+                tp3 = entry + risk * RR3
+                tp4 = entry + risk * RR4
                 side = "BUY"
                 is_forced = force_long_cond and not long_cond
             else:
                 sl = entry + sl_dist
                 risk = sl - entry
-                tp1, tp2, tp3 = entry - risk * RR1, entry - risk * RR2, entry - risk * RR3
+                tp1 = entry - risk * RR1
+                tp2 = entry - risk * RR2
+                tp3 = entry - risk * RR3
+                tp4 = entry - risk * RR4
                 side = "SELL"
                 is_forced = force_short_cond and not short_cond
 
-            state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, bar_time)
+            state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time)
 
             # Mark the Daily Trade Guarantee as satisfied for today, exactly
             # like the indicator setting tradedToday/forceAttemptedTdy on
@@ -1032,6 +1109,7 @@ def check():
                 f"TP1: {tp1:.2f}\n"
                 f"TP2: {tp2:.2f}\n"
                 f"TP3: {tp3:.2f}\n"
+                f"TP4: {tp4:.2f}\n"
                 f"Supertrend ({TIMEFRAME}): {trend_arrow(last['st_dir'])}\n"
                 f"{htf_line}"
                 f"Bar: {bar_time} ({FORCE_TIMEZONE})"
@@ -1047,6 +1125,7 @@ def check():
             result["tp1"] = tp1
             result["tp2"] = tp2
             result["tp3"] = tp3
+            result["tp4"] = tp4
         elif force_entry_now:
             # Force-entry time passed, but direction resolution somehow
             # produced neither (shouldn't happen since forceDirection always
@@ -1122,7 +1201,10 @@ def test_signal():
     sl_dist = min(max(last["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
     sl = entry - sl_dist
     risk = entry - sl
-    tp1, tp2, tp3 = entry + risk * RR1, entry + risk * RR2, entry + risk * RR3
+    tp1 = entry + risk * RR1
+    tp2 = entry + risk * RR2
+    tp3 = entry + risk * RR3
+    tp4 = entry + risk * RR4
 
     msg = (
         f"[TEST] XAUUSD BUY signal (Supertrend)\n"
@@ -1131,6 +1213,7 @@ def test_signal():
         f"TP1: {tp1:.2f}\n"
         f"TP2: {tp2:.2f}\n"
         f"TP3: {tp3:.2f}\n"
+        f"TP4: {tp4:.2f}\n"
         f"Bar: {last['datetime']} ({FORCE_TIMEZONE})\n"
         f"(This is a forced test message, not a real signal)"
     )
@@ -1311,7 +1394,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   .panel-body{padding:18px;}
   .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}
-  @media (max-width:560px){.grid4{grid-template-columns:repeat(2,1fr);}}
+  .grid5{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;}
+  @media (max-width:560px){.grid4{grid-template-columns:repeat(2,1fr);} .grid5{grid-template-columns:repeat(2,1fr);}}
   .stat-box{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px;}
   .stat-box .k{font-size:10.5px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px;}
   .stat-box .v{font-family:var(--mono);font-size:16px;font-weight:600;}
@@ -1468,7 +1552,7 @@ function positionKv(pos){
     <div class="kv"><span class="k">Side</span><span class="v side-tag ${sideClass}">${side}</span></div>
     <div class="kv"><span class="k">Entry</span><span class="v">${fmtPrice(pos.entry)}</span></div>
     <div class="kv"><span class="k">Stop Loss</span><span class="v">${fmtPrice(pos.sl)}</span></div>
-    <div class="kv"><span class="k">TP1 / TP2 / TP3</span><span class="v">${fmtPrice(pos.tp1)} / ${fmtPrice(pos.tp2)} / ${fmtPrice(pos.tp3)}</span></div>
+    <div class="kv"><span class="k">TP1 / TP2 / TP3 / TP4</span><span class="v">${fmtPrice(pos.tp1)} / ${fmtPrice(pos.tp2)} / ${fmtPrice(pos.tp3)} / ${fmtPrice(pos.tp4)}</span></div>
     <div class="kv"><span class="k">Remaining size</span><span class="v">${Math.round(pos.remaining_size*100)}%</span></div>
   `;
 }
@@ -1480,11 +1564,12 @@ function renderCheck(data){
     const sideClass = data.side === 'BUY' ? 'buy' : 'sell';
     entryBlock = `
       <div class="section-label">New Signal</div>
-      <div class="grid4">
+      <div class="grid5">
         <div class="stat-box"><div class="k">Side</div><div class="v side-tag ${sideClass}">${data.side}${data.forced ? ' ⚡' : ''}</div></div>
         <div class="stat-box"><div class="k">Entry</div><div class="v gold">${fmtPrice(data.entry)}</div></div>
         <div class="stat-box"><div class="k">Stop Loss</div><div class="v neg">${fmtPrice(data.sl)}</div></div>
-        <div class="stat-box"><div class="k">Take Profits</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp1)} · ${fmtPrice(data.tp2)} · ${fmtPrice(data.tp3)}</div></div>
+        <div class="stat-box"><div class="k">TP1 / TP2</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp1)} · ${fmtPrice(data.tp2)}</div></div>
+        <div class="stat-box"><div class="k">TP3 / TP4</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp3)} · ${fmtPrice(data.tp4)}</div></div>
       </div>
       ${data.forced ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">⚡ Opened by the Daily Trade Guarantee fallback, not the organic signal stack.</p>` : ''}
       ${data.pullback ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">↩ Opened after a pullback confirmation, not on the initial cross bar.</p>` : ''}

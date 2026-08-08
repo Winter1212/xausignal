@@ -126,7 +126,10 @@ RR1, RR2, RR3, RR4 = 1.9, 3.0, 4.0, 4.0
 # "tp1_only" | "first_hit" | "partial"  (matches the indicator's pnlMode dropdown)
 # Pine's default is "Ratchet SL (Book Once: BE -> TP1 -> TP2 -> TP4)" -> "partial"
 # here (the name "partial" is legacy — nothing is actually partially closed,
-# see the big note on partial_close_tp1/2/3 below).
+# see the big note on ratchet_to_breakeven/ratchet_to_tp1/ratchet_to_tp2
+# below — the position stays full size the whole time and exactly ONE
+# dollar figure is ever booked per trade, matching the indicator's
+# closeTrade()).
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
 # ---------------------- RUNNER MANAGEMENT ----------------------
@@ -485,6 +488,18 @@ def build_stats_telegram_message(payload, state):
 
 # ---------------------- TRADE LOG ----------------------
 def log_trade(state, side, entry, sl, tp1, tp2, tp3, tp4, exit_price, result, points, pnl):
+    """Writes exactly ONE row to the trade log AND adds pnl to sum_pnl.
+
+    IMPORTANT: this is the ONLY place P&L should ever be booked. It is
+    called from settle_trade() alone. Do NOT call this from the ratchet
+    helpers (ratchet_to_breakeven / ratchet_to_tp1 / ratchet_to_tp2) below —
+    those only move the stop loss and must never add to sum_pnl or write a
+    log row, exactly like the Pine indicator's ratchetToBreakeven() /
+    ratchetToTP1() / ratchetToTP2(), which only call line.set_y1/y2 and
+    never call closeTrade(). Calling log_trade() from a ratchet step would
+    double-book profit (once at the ratchet, again when the position
+    finally closes) — see the fix note near ratchet_to_breakeven() below.
+    """
     state["history"].insert(0, {
         "side": side, "entry": entry, "sl": sl,
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "exit": exit_price,
@@ -495,19 +510,24 @@ def log_trade(state, side, entry, sl, tp1, tp2, tp3, tp4, exit_price, result, po
 
 
 def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
-    """Fully closes whatever size remains and settles win/loss stats.
-    A trade counts as a win overall if this final leg was positive, OR if an
-    earlier TP1/TP2/TP3 ratchet already locked in profit — same rule as the
-    indicator's closeTrade().
+    """Fully closes the position and settles win/loss stats. This is the
+    ONLY function that ever books P&L / writes a trade-log row (matches the
+    Pine indicator's closeTrade(), which is likewise the sole place that
+    calls array.unshift(history, t) and adjusts S.sumPnl). A trade counts
+    as a win overall if this final leg was positive, OR if an earlier
+    TP1/TP2/TP3 ratchet already locked in guaranteed profit — same rule as
+    the indicator's closeTrade() (pnl >= 0 check plus the ratchet flags).
 
     pnl_override: when provided, this exact dollar amount is booked for this
-    leg instead of deriving it from pos['remaining_size']. Used by the
-    TP4 / final-leg exit so it books its full configured dollar value (see
-    the TP1/TP2/TP3/TP4 fixed-payout ladder introduced below) rather than a
-    fraction of the original position size.
+    leg instead of deriving it from points * full position size. Used by
+    the "SL Hit (After TPx — Locked at TPy)" exits so they book the
+    TPy-level profit rather than re-deriving from the ratcheted SL price
+    relative to entry (which would give the same number, but this keeps the
+    call sites explicit and matches the indicator's approach of passing the
+    intended dollar amount straight through).
     """
     points = (exit_price - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - exit_price)
-    pnl = pnl_override if pnl_override is not None else points * LOT_SIZE * pos["remaining_size"] * UNITS_PER_LOT
+    pnl = pnl_override if pnl_override is not None else points * LOT_SIZE * UNITS_PER_LOT
 
     log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
               pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
@@ -515,7 +535,7 @@ def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
 
     stats = state["stats"]
     stats["total_trades"] += 1
-    combined_positive = pnl > 0 or pos["tp1_hit"] or pos["tp2_hit"] or pos["tp3_hit"]
+    combined_positive = pnl >= 0
     if combined_positive:
         stats["wins"] += 1
     else:
@@ -527,71 +547,47 @@ def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
     return pnl
 
 
-def partial_close_tp1(state, pos):
-    """TP1 hit: books the FULL configured TP1 dollar value (points *
-    LOT_SIZE * UNITS_PER_LOT) — e.g. with RR1=1.9 and a 10pt SL, this books
-    $19. Then moves the SL to breakeven (entry) so the rest of the trade
-    can never turn into an overall loss.
-
-    NOTE: nothing is actually partially closed anymore — the position
-    stays at full size the whole time. This just logs the TP1-level profit
-    as a bookkeeping row and ratchets the stop. The name/remaining_size
-    field is kept only for the dashboard's "remaining size" display."""
-    points = (pos["tp1"] - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - pos["tp1"])
-    pnl = points * LOT_SIZE * UNITS_PER_LOT
-
-    log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
-              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
-              pos["tp1"], f"TP1 Hit (+${pnl:.2f}, SL->Entry)", points, pnl)
-
+# ---------------------- RATCHET HELPERS (book-once model) ----------------------
+# FIX: these previously (as partial_close_tp1/tp2/tp3) called log_trade()
+# and added to sum_pnl on EVERY ratchet step, then settle_trade() booked
+# ANOTHER dollar amount when the trade finally closed — stacking 2-4x the
+# real profit into Net P&L and writing 2-4 trade-log rows per position.
+# That does not match the Pine indicator, which is explicit that "exactly
+# ONE dollar figure ever [gets] booked per position — never stacked."
+#
+# These functions now ONLY move the stop loss (and set the tpX_hit flag /
+# a cosmetic remaining_size used purely for the dashboard's progress
+# display). No P&L is booked and no log row is written here — that only
+# happens once, in settle_trade(), exactly mirroring the Pine indicator's
+# ratchetToBreakeven() / ratchetToTP1() / ratchetToTP2(), which only call
+# line.set_y1()/line.set_y2() and never call closeTrade().
+def ratchet_to_breakeven(pos):
+    """TP1 touched: SL -> entry (breakeven). No P&L booked yet."""
     pos["tp1_hit"] = True
-    pos["remaining_size"] = 0.75
+    pos["remaining_size"] = 0.75  # cosmetic only, for the dashboard
     pos["sl"] = pos["entry"]
-    return pnl
 
 
-def partial_close_tp2(state, pos):
-    """TP2 hit: books the FULL configured TP2 dollar value (points *
-    LOT_SIZE * UNITS_PER_LOT) — e.g. with RR2=2.7 and a 10pt SL, this books
-    $27. Then moves the SL up to TP1 so the trade can only exit at
-    TP1-or-better from here."""
-    points = (pos["tp2"] - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - pos["tp2"])
-    pnl = points * LOT_SIZE * UNITS_PER_LOT
-
-    log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
-              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
-              pos["tp2"], f"TP2 Hit (+${pnl:.2f}, SL->TP1)", points, pnl)
-
+def ratchet_to_tp1(pos):
+    """TP2 touched: SL -> TP1. No P&L booked yet."""
     pos["tp2_hit"] = True
-    pos["remaining_size"] = 0.5
+    pos["remaining_size"] = 0.5  # cosmetic only, for the dashboard
     pos["sl"] = pos["tp1"]
-    return pnl
 
 
-def partial_close_tp3(state, pos):
-    """TP3 hit: books the FULL configured TP3 dollar value (points *
-    LOT_SIZE * UNITS_PER_LOT) — e.g. with RR3=3.5 and a 10pt SL, this books
-    $35. Then moves the SL up to TP2 so the final runner leg can only exit
-    at TP2-or-better or TP4."""
-    points = (pos["tp3"] - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - pos["tp3"])
-    pnl = points * LOT_SIZE * UNITS_PER_LOT
-
-    log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
-              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
-              pos["tp3"], f"TP3 Hit (+${pnl:.2f}, SL->TP2)", points, pnl)
-
+def ratchet_to_tp2(pos):
+    """TP3 touched: SL -> TP2. No P&L booked yet."""
     pos["tp3_hit"] = True
-    pos["remaining_size"] = 0.25
+    pos["remaining_size"] = 0.25  # cosmetic only, for the dashboard
     pos["sl"] = pos["tp2"]
-    return pnl
 
 
 def trail_runner_sl(pos, st_value):
     """DEPRECATED / no longer called by manage_position(). Kept only for
     reference — previously trailed the runner's SL to the live Supertrend
     value after TP1+TP2+TP3 were booked. The runner leg now uses a fixed
-    SL at TP2 instead of a Supertrend trail. See partial_close_tp1/2/3 and
-    the final-leg branch in manage_position()."""
+    SL at TP2 instead of a Supertrend trail. See ratchet_to_tp2() and the
+    final-leg branch in manage_position()."""
     if st_value is None or pd.isna(st_value):
         return
     if pos["dir"] == 1 and st_value > pos["sl"]:
@@ -607,7 +603,7 @@ def manage_position(state, last_candle, st_value):
         return False
 
     high, low = last_candle["high"], last_candle["low"]
-    events = []
+    events = []  # list of (label, price, pnl_or_None) — pnl is None for a pure ratchet (no booking)
 
     def buy_side():
         if PNL_MODE == "tp1_only":
@@ -633,7 +629,7 @@ def manage_position(state, last_candle, st_value):
             elif high >= pos["tp1"]:
                 pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
                 events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:  # partial (== ratcheting SL, book once)
+        else:  # partial (== ratcheting SL, book once — matches Pine's default mode)
             if not pos["tp1_hit"]:
                 if low <= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
@@ -642,35 +638,35 @@ def manage_position(state, last_candle, st_value):
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap, Full Size)")
                     events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
                 elif high >= pos["tp3"]:
-                    p1 = partial_close_tp1(state, pos)
-                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
-                    p3 = partial_close_tp3(state, pos)
-                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+                    ratchet_to_breakeven(pos)
+                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
+                    ratchet_to_tp2(pos)
+                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
                 elif high >= pos["tp2"]:
-                    p1 = partial_close_tp1(state, pos)
-                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    ratchet_to_breakeven(pos)
+                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
                 elif high >= pos["tp1"]:
-                    p1 = partial_close_tp1(state, pos)
-                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
+                    ratchet_to_breakeven(pos)
+                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
             elif pos["tp1_hit"] and not pos["tp2_hit"]:
                 if low <= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven)")
-                    events.append(("SL Hit (After TP1 — Breakeven)", pos["sl"], pnl))
+                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven, $0)")
+                    events.append(("SL Hit (After TP1 — Breakeven, $0)", pos["sl"], pnl))
                 elif high >= pos["tp4"]:
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
                     events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif high >= pos["tp3"]:
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
-                    p3 = partial_close_tp3(state, pos)
-                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
+                    ratchet_to_tp2(pos)
+                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
                 elif high >= pos["tp2"]:
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
             elif pos["tp2_hit"] and not pos["tp3_hit"]:
                 if low <= pos["sl"]:
                     points = pos["tp1"] - pos["entry"]
@@ -681,14 +677,17 @@ def manage_position(state, last_candle, st_value):
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
                     events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif high >= pos["tp3"]:
-                    p3 = partial_close_tp3(state, pos)
-                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+                    ratchet_to_tp2(pos)
+                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
             else:
                 # Final runner leg: SL is fixed at TP2 (set when TP3 was
                 # booked). No more Supertrend trailing — either SL is hit
                 # (locking in the TP2 amount for this leg) or TP4 is hit
                 # (booking the full TP4 dollar value), and the position is
-                # closed either way.
+                # closed either way. This is the ONLY branch that books
+                # P&L for this trade at this point (or the earlier SL/TP4
+                # branches above) — everything before this was a pure
+                # ratchet with no booking.
                 if low <= pos["sl"]:
                     points = pos["tp2"] - pos["entry"]
                     pnl = points * LOT_SIZE * UNITS_PER_LOT
@@ -724,7 +723,7 @@ def manage_position(state, last_candle, st_value):
             elif low <= pos["tp1"]:
                 pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
                 events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:  # partial (== ratcheting SL, book once)
+        else:  # partial (== ratcheting SL, book once — matches Pine's default mode)
             if not pos["tp1_hit"]:
                 if high >= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
@@ -733,35 +732,35 @@ def manage_position(state, last_candle, st_value):
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap, Full Size)")
                     events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
                 elif low <= pos["tp3"]:
-                    p1 = partial_close_tp1(state, pos)
-                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
-                    p3 = partial_close_tp3(state, pos)
-                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+                    ratchet_to_breakeven(pos)
+                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
+                    ratchet_to_tp2(pos)
+                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
                 elif low <= pos["tp2"]:
-                    p1 = partial_close_tp1(state, pos)
-                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    ratchet_to_breakeven(pos)
+                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
                 elif low <= pos["tp1"]:
-                    p1 = partial_close_tp1(state, pos)
-                    events.append((f"TP1 Hit (+${p1:.2f}, SL->Entry)", pos["tp1"], p1))
+                    ratchet_to_breakeven(pos)
+                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
             elif pos["tp1_hit"] and not pos["tp2_hit"]:
                 if high >= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven)")
-                    events.append(("SL Hit (After TP1 — Breakeven)", pos["sl"], pnl))
+                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven, $0)")
+                    events.append(("SL Hit (After TP1 — Breakeven, $0)", pos["sl"], pnl))
                 elif low <= pos["tp4"]:
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
                     events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif low <= pos["tp3"]:
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
-                    p3 = partial_close_tp3(state, pos)
-                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
+                    ratchet_to_tp2(pos)
+                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
                 elif low <= pos["tp2"]:
-                    p2 = partial_close_tp2(state, pos)
-                    events.append((f"TP2 Hit (+${p2:.2f}, SL->TP1)", pos["tp2"], p2))
+                    ratchet_to_tp1(pos)
+                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
             elif pos["tp2_hit"] and not pos["tp3_hit"]:
                 if high >= pos["sl"]:
                     points = pos["entry"] - pos["tp1"]
@@ -772,8 +771,8 @@ def manage_position(state, last_candle, st_value):
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
                     events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
                 elif low <= pos["tp3"]:
-                    p3 = partial_close_tp3(state, pos)
-                    events.append((f"TP3 Hit (+${p3:.2f}, SL->TP2)", pos["tp3"], p3))
+                    ratchet_to_tp2(pos)
+                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
             else:
                 # Final runner leg: SL is fixed at TP2 (set when TP3 was
                 # booked). No more Supertrend trailing — either SL is hit
@@ -798,11 +797,20 @@ def manage_position(state, last_candle, st_value):
 
     side = "BUY" if pos["dir"] == 1 else "SELL"
     for label, price, pnl in events:
-        msg = (
-            f"XAUUSD {side} — {label}\n"
-            f"Price: {price:.2f}\n"
-            f"P&L (this leg): {'+' if pnl >= 0 else ''}${pnl:.2f}"
-        )
+        if pnl is None:
+            # Pure ratchet step — SL moved, nothing booked yet. No dollar
+            # figure to show (there isn't one until the position closes).
+            msg = (
+                f"XAUUSD {side} — {label}\n"
+                f"Price: {price:.2f}\n"
+                f"(Stop loss moved — no P&L booked yet, position still open)"
+            )
+        else:
+            msg = (
+                f"XAUUSD {side} — {label}\n"
+                f"Price: {price:.2f}\n"
+                f"P&L (trade closed): {'+' if pnl >= 0 else ''}${pnl:.2f}"
+            )
         send_telegram(msg)
 
     return len(events) > 0

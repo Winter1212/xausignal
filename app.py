@@ -938,7 +938,7 @@ def check():
     if not TWELVE_DATA_API_KEYS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
-    df = fetch_candles(TIMEFRAME, outputsize=200)
+    df = fetch_candles(TIMEFRAME, outputsize=500)
     df["emaFast"] = ema(df["close"], FAST_LEN)
     df["emaSlow"] = ema(df["close"], SLOW_LEN)
     df["rsi"] = rsi(df["close"], RSI_LEN)
@@ -1012,7 +1012,7 @@ def check():
         # --- Higher-timeframe Supertrend confirmation (matches useHTF) ---
         htf_dir = 0
         if USE_HTF:
-            htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=100)
+            htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=500)
             _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
             htf_dir = int(htf_dir_series.iloc[-1])
         htf_bullish = (not USE_HTF) or htf_dir == 1

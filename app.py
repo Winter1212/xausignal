@@ -121,7 +121,7 @@ ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 1.9, 3.0, 4.0, 4.0
+RR1, RR2, RR3, RR4 = 1.85, 2.0, 3.0, 3.5
 
 # "tp1_only" | "first_hit" | "partial"  (matches the indicator's pnlMode dropdown)
 # Pine's default is "Ratchet SL (Book Once: BE -> TP1 -> TP2 -> TP4)" -> "partial"

@@ -174,7 +174,7 @@ def _key_label(i):
     return f"key_{i + 1}"
 
 
-def fetch_candles(interval, outputsize=200, credits_per_call=3):
+def fetch_candles(interval, outputsize=8400, credits_per_call=3):
     """
     Fetches candles from Twelve Data, rotating across up to 3 configured API
     keys. Each call advances the rotation by one key (round-robin), and

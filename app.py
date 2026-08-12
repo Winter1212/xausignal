@@ -92,7 +92,7 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 # the freshly-fetched candle window every time /check runs. See
 # roll_pullback_state() below.
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
-PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.2))
+PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.4))
 PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 4))
 
 # Overextension filter: blocks ANY organic entry (pullback or immediate

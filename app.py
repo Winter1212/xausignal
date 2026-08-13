@@ -34,7 +34,7 @@ TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart ti
 # indicator's "Force-Entry Timezone" input default ("Asia/Phnom_Penh",
 # Cambodia, UTC+7). This drives the Daily Trade Guarantee's day-boundary
 # AND its FORCE_HOUR/FORCE_MINUTE check below, AND (now) the weekend
-# no-new-signals guard below.
+# no-new-signals guard below, AND the trading-hours guard below.
 FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 
 # ---------------------- WEEKEND GUARD ----------------------
@@ -47,6 +47,22 @@ FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 # off again.
 DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lower() == "true"
 
+# ---------------------- TRADING HOURS GUARD ----------------------
+# Mirrors the indicator's "Trading Hours" filter in the Session Filter
+# group. When enabled (the default), the bot will NOT open any NEW signal
+# -- organic, pullback, or Forced Daily -- outside the daily window below,
+# evaluated in FORCE_TIMEZONE (Cambodia by default). Default window is
+# 06:30-23:59, so nothing fires overnight while you're asleep. It still
+# manages/closes any already-open position outside the window; this only
+# blocks opening NEW trades, exactly like the weekend guard, and it stacks
+# with the weekend guard rather than replacing it. Set
+# USE_TRADING_HOURS=false to trade 24 hours a day again.
+USE_TRADING_HOURS   = os.environ.get("USE_TRADING_HOURS", "true").lower() == "true"
+TRADING_START_HOUR   = int(os.environ.get("TRADING_START_HOUR", 6))
+TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
+TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 23))
+TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
+
 KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
 
 # ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
@@ -54,7 +70,7 @@ KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily
 FAST_LEN = 30
 SLOW_LEN = 32
 USE_RSI = True
-RSI_LEN = 15
+RSI_LEN = 16
 RSI_OB = 70   # block buys above this
 RSI_OS = 30   # block sells below this
 
@@ -93,14 +109,14 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 # roll_pullback_state() below.
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
 PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.4))
-PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 4))
+PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 8))
 
 # Overextension filter: blocks ANY organic entry (pullback or immediate
 # mode) if price is currently too far from the Fast EMA in ATR terms —
 # the "already extended, about to mean-revert" state the indicator's
 # changelog calls out as the cause of its losing SELLs.
 USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
-MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
+MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.5))
 
 # ---------------------- DAILY TRADE GUARANTEE (exact indicator defaults) ----------------------
 # Matches the indicator's "Daily Trade Guarantee" group. If nothing organic
@@ -109,9 +125,10 @@ MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
 # one entry in the direction of the prevailing trend so every day gets >= 1
 # trade. This is a SEPARATE, clearly-tagged fallback — it never loosens the
 # organic EMA/RSI/Supertrend/HTF/pullback/extension stack above. It is also
-# subject to the weekend guard above, so it will not fire on Sat/Sun.
+# subject to the weekend guard AND the trading-hours guard above, so it
+# will not fire on Sat/Sun or outside the trading-hours window.
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
-FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))    # 0-23, in FORCE_TIMEZONE (see NOTE above)
+FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 11))    # 0-23, in FORCE_TIMEZONE (see NOTE above)
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
 
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
@@ -121,7 +138,7 @@ ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 1.9, 3.0, 4.0, 4.0
+RR1, RR2, RR3, RR4 = 1.9, 2.5, 2.5, 3.5
 
 # "tp1_only" | "first_hit" | "partial"  (matches the indicator's pnlMode dropdown)
 # Pine's default is "Ratchet SL (Book Once: BE -> TP1 -> TP2 -> TP4)" -> "partial"
@@ -187,9 +204,10 @@ def fetch_candles(interval, outputsize=5000, credits_per_call=3):
     Passes `timezone=FORCE_TIMEZONE` on every request so the returned
     "datetime" values are pre-localized to that zone (see the NOTE at the
     top of this file) — this is what makes the Daily Trade Guarantee's
-    FORCE_HOUR/FORCE_MINUTE and day-boundary checks correct for Cambodia
-    (or whatever FORCE_TIMEZONE is set to) regardless of the underlying
-    exchange feed's own timezone.
+    FORCE_HOUR/FORCE_MINUTE and day-boundary checks (and the trading-hours
+    guard's start/end checks) correct for Cambodia (or whatever
+    FORCE_TIMEZONE is set to) regardless of the underlying exchange feed's
+    own timezone.
     """
     if not TWELVE_DATA_API_KEYS:
         raise RuntimeError("No Twelve Data API key configured. Set TWELVE_DATA_API_KEY_1 (and optionally _2 / _3).")
@@ -358,6 +376,33 @@ def is_weekend_bar(bar_dt):
     return bar_dt.weekday() >= 5
 
 
+def is_outside_trading_hours(bar_dt):
+    """
+    True when bar_dt (already localized to FORCE_TIMEZONE) falls outside
+    the [TRADING_START_HOUR:TRADING_START_MINUTE, TRADING_END_HOUR:TRADING_END_MINUTE]
+    window. Mirrors the indicator's isWithinTradingHours/outsideTradingHours
+    logic exactly. Always False when USE_TRADING_HOURS is off.
+    """
+    if not USE_TRADING_HOURS:
+        return False
+    minutes_now = bar_dt.hour * 60 + bar_dt.minute
+    start_min = TRADING_START_HOUR * 60 + TRADING_START_MINUTE
+    end_min = TRADING_END_HOUR * 60 + TRADING_END_MINUTE
+    return not (start_min <= minutes_now <= end_min)
+
+
+def is_new_entries_blocked(bar_dt):
+    """
+    Combined gate mirroring the indicator's `entriesBlocked` (weekend OR
+    outside trading hours). Used everywhere a NEW entry (organic, pullback,
+    or Forced Daily) is considered. Never affects management of an already
+    open position.
+    """
+    weekend = DISABLE_WEEKEND_SIGNALS and is_weekend_bar(bar_dt)
+    outside_hours = is_outside_trading_hours(bar_dt)
+    return weekend, outside_hours, (weekend or outside_hours)
+
+
 # ---------------------- STATE ----------------------
 DEFAULT_STATE = {
     "last_signal_bar": None,
@@ -434,6 +479,8 @@ def build_check_telegram_message(result, state):
         lines.append("Result: open position was updated this check (TP/SL/trail — see the alert above).")
     elif result.get("weekend_skipped"):
         lines.append("Result: weekend — new-signal checks skipped (existing position, if any, still managed).")
+    elif result.get("trading_hours_skipped"):
+        lines.append("Result: outside trading hours — new-signal checks skipped (existing position, if any, still managed).")
     else:
         pending = state.get("pending_dir")
         if pending:
@@ -482,6 +529,13 @@ def build_stats_telegram_message(payload, state):
         f"{dg['force_hour']:02d}:{dg['force_minute']:02d} {dg['force_timezone']} | "
         f"traded today: {'yes' if dg['traded_today'] else 'no'}"
     )
+
+    th = payload.get("trading_hours", {})
+    if th.get("enabled"):
+        lines.append(
+            f"Trading hours: {th['start_hour']:02d}:{th['start_minute']:02d}"
+            f"-{th['end_hour']:02d}:{th['end_minute']:02d} {th['timezone']}"
+        )
 
     return "\n".join(lines)
 
@@ -846,7 +900,8 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
       isPastForceTime = (hour*60+minute) >= (forceHour*60+forceMinute)
       forceEntryNow    = guaranteeDailyTrade and isPastForceTime
                           and not forceAttemptedTdy and not tradedToday
-                          and flat and not weekend
+                          and flat and not entriesBlocked (weekend OR
+                          outside trading hours)
       forceDirection   = entry-TF Supertrend, else HTF Supertrend,
                           else EMA position (always resolves to +-1)
 
@@ -859,7 +914,8 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
     if not GUARANTEE_DAILY_TRADE:
         return False, 0
 
-    if DISABLE_WEEKEND_SIGNALS and is_weekend_bar(bar_dt):
+    _, _, blocked = is_new_entries_blocked(bar_dt)
+    if blocked:
         return False, 0
 
     is_past_force_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HOUR * 60 + FORCE_MINUTE)
@@ -900,14 +956,20 @@ def bars_since_pending_armed(df, pending_bar_time):
 
 
 def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
-                         base_long_cond, base_short_cond):
+                         base_long_cond, base_short_cond, entries_blocked=False):
     """
     Mirrors the indicator's pending-signal block:
 
       if baseLongCond:  pendingLong := true,  pendingShort := false
       if baseShortCond: pendingShort := true, pendingLong := false
-      if pendingLong  and (not stBullish or not htfBullish or timeout): pendingLong := false
-      if pendingShort and (not stBearish or not htfBearish or timeout): pendingShort := false
+      if pendingLong  and (not stBullish or not htfBullish or timeout or entriesBlocked): pendingLong := false
+      if pendingShort and (not stBearish or not htfBearish or timeout or entriesBlocked): pendingShort := false
+
+    entries_blocked mirrors the indicator's combined weekend-OR-outside-
+    trading-hours gate: a pending signal is cancelled outright the moment
+    it goes true, exactly like the weekend cancellation already did, so a
+    signal armed right before the trading window closes can't silently
+    fire once you're asleep.
 
     Mutates state["pending_dir"] / state["pending_bar_time"] in place.
     """
@@ -922,12 +984,12 @@ def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish
 
     if state["pending_dir"] == 1:
         timed_out = bars_since is not None and bars_since > PULLBACK_TIMEOUT_BARS
-        if not st_bullish or not htf_bullish or timed_out:
+        if not st_bullish or not htf_bullish or timed_out or entries_blocked:
             state["pending_dir"] = None
             state["pending_bar_time"] = None
     elif state["pending_dir"] == -1:
         timed_out = bars_since is not None and bars_since > PULLBACK_TIMEOUT_BARS
-        if not st_bearish or not htf_bearish or timed_out:
+        if not st_bearish or not htf_bearish or timed_out or entries_blocked:
             state["pending_dir"] = None
             state["pending_bar_time"] = None
 
@@ -960,9 +1022,9 @@ def check():
     roll_daily_guarantee_state(state, last["datetime"])
 
     # 1) Manage an already-open position against this bar's high/low.
-    #    This still runs on weekends -- if a position is open going into
-    #    the weekend we keep tracking SL/TP against whatever the feed
-    #    reports, we just won't OPEN anything new below.
+    #    This still runs on weekends and outside trading hours -- if a
+    #    position is open going into either we keep tracking SL/TP against
+    #    whatever the feed reports, we just won't OPEN anything new below.
     if state["position"] is not None and state.get("last_exit_bar") != bar_time:
         acted = manage_position(state, last, last["st"])
         state["last_exit_bar"] = bar_time
@@ -970,30 +1032,33 @@ def check():
             result["event"] = "position_update"
         save_state(state)
 
-    # 1b) Weekend guard: don't evaluate/open any NEW signal (organic or
+    # 1b) Session guard: don't evaluate/open any NEW signal (organic or
     #     forced) while the current bar is a Saturday/Sunday in
-    #     FORCE_TIMEZONE. Still update last_signal_bar so we don't just
-    #     spin re-checking the same closed bar all weekend. Also
-    #     explicitly clears any pending pullback signal that was armed
-    #     before the weekend started -- this mirrors the indicator's
-    #     "weekendBlocked" cancellation of pendingLong/pendingShort, so a
-    #     signal armed Friday afternoon can never silently fire on the
-    #     Sunday-night/Monday-open bar. Without this it would simply have
-    #     been *frozen* (never re-evaluated) and left to expire on its own
-    #     via the pullback timeout once Monday's bar was processed, which
-    #     usually resolves the same way but wasn't a guaranteed match.
-    weekend_now = DISABLE_WEEKEND_SIGNALS and is_weekend_bar(last["datetime"])
-    if weekend_now:
+    #     FORCE_TIMEZONE, OR while it's outside the configured trading-hours
+    #     window (default 06:30-23:59 FORCE_TIMEZONE, so nothing fires
+    #     overnight while you're asleep). Still update last_signal_bar so we
+    #     don't just spin re-checking the same closed bar. Also explicitly
+    #     clears any pending pullback signal that was armed before the
+    #     block started -- this mirrors the indicator's "entriesBlocked"
+    #     cancellation of pendingLong/pendingShort, so a signal armed just
+    #     before the window closes (or the weekend starts) can never
+    #     silently fire once you're asleep / once markets are shut. Without
+    #     this it would simply have been *frozen* (never re-evaluated) and
+    #     left to expire on its own via the pullback timeout, which usually
+    #     resolves the same way but wasn't a guaranteed match.
+    weekend_now, outside_hours_now, blocked_now = is_new_entries_blocked(last["datetime"])
+    if blocked_now:
         state["last_signal_bar"] = bar_time
         if state.get("pending_dir") is not None:
             state["pending_dir"] = None
             state["pending_bar_time"] = None
-        result["weekend_skipped"] = True
+        result["weekend_skipped"] = weekend_now
+        result["trading_hours_skipped"] = outside_hours_now
         save_state(state)
 
     # 2) Only look for a NEW entry if we're currently flat, it's not a bar
-    #    we've already processed, and it's not the weekend.
-    if (not weekend_now) and state["position"] is None and state.get("last_signal_bar") != bar_time:
+    #    we've already processed, and it's not weekend/outside trading hours.
+    if (not blocked_now) and state["position"] is None and state.get("last_signal_bar") != bar_time:
         prev = df.iloc[-2]
 
         ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and last["emaFast"] > last["emaSlow"]
@@ -1033,10 +1098,12 @@ def check():
         base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
 
         # --- Arm / cancel the pending pullback signal (matches the
-        #     indicator's pendingLong/pendingShort block) ---
+        #     indicator's pendingLong/pendingShort block). blocked_now is
+        #     always False here (we're inside the `not blocked_now` branch)
+        #     but is passed through for symmetry with the indicator's gate. ---
         roll_pullback_state(
             state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
-            base_long_cond, base_short_cond,
+            base_long_cond, base_short_cond, entries_blocked=blocked_now,
         )
 
         # --- Organic entry conditions (matches longCond/shortCond) ---
@@ -1185,6 +1252,14 @@ def stats():
         "weekend_guard": {
             "enabled": DISABLE_WEEKEND_SIGNALS,
         },
+        "trading_hours": {
+            "enabled": USE_TRADING_HOURS,
+            "start_hour": TRADING_START_HOUR,
+            "start_minute": TRADING_START_MINUTE,
+            "end_hour": TRADING_END_HOUR,
+            "end_minute": TRADING_END_MINUTE,
+            "timezone": FORCE_TIMEZONE,
+        },
     }
 
     if _notify_requested():
@@ -1261,6 +1336,9 @@ def health():
         "force_minute": FORCE_MINUTE,
         "force_timezone": FORCE_TIMEZONE,
         "disable_weekend_signals": DISABLE_WEEKEND_SIGNALS,
+        "use_trading_hours": USE_TRADING_HOURS,
+        "trading_start": f"{TRADING_START_HOUR:02d}:{TRADING_START_MINUTE:02d}" if USE_TRADING_HOURS else None,
+        "trading_end": f"{TRADING_END_HOUR:02d}:{TRADING_END_MINUTE:02d}" if USE_TRADING_HOURS else None,
         "dashboard": "/dashboard",
     })
 
@@ -1545,10 +1623,11 @@ function renderError(msg){
   document.getElementById('results').innerHTML = `<div class="error-box">⚠ ${esc(msg)}</div>`;
 }
 
-function eventBadge(event, weekendSkipped){
+function eventBadge(event, weekendSkipped, hoursSkipped){
   if(event === 'entry') return `<span class="badge neutral">New Entry</span>`;
   if(event === 'position_update') return `<span class="badge muted">Position Updated</span>`;
   if(weekendSkipped) return `<span class="badge muted">Weekend — Skipped</span>`;
+  if(hoursSkipped) return `<span class="badge muted">Outside Trading Hours</span>`;
   return `<span class="badge muted">No Signal</span>`;
 }
 
@@ -1590,20 +1669,22 @@ function renderCheck(data){
     pendingBlock = `<div class="kv"><span class="k">Pending signal</span><span class="v">${dirLabel} (waiting for pullback)</span></div>`;
   }
 
-  let weekendBlock = '';
+  let sessionBlock = '';
   if(data.weekend_skipped){
-    weekendBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">🌙 Weekend — new-signal checks are paused. Any open position is still tracked.</p>`;
+    sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">🌙 Weekend — new-signal checks are paused. Any open position is still tracked.</p>`;
+  }else if(data.trading_hours_skipped){
+    sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">🌙 Outside trading hours — new-signal checks are paused. Any open position is still tracked.</p>`;
   }
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
       <div class="panel-head">
-        <div class="title">Check Result ${eventBadge(data.event, data.weekend_skipped)} ${notifiedBadge}</div>
+        <div class="title">Check Result ${eventBadge(data.event, data.weekend_skipped, data.trading_hours_skipped)} ${notifiedBadge}</div>
         <div class="timestamp">${esc(data.bar_time || '—')}</div>
       </div>
       <div class="panel-body">
         ${entryBlock}
-        ${weekendBlock}
+        ${sessionBlock}
         ${pendingBlock}
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}
@@ -1631,6 +1712,7 @@ function renderStats(data){
 
   const dg = data.daily_guarantee || {};
   const ps = data.pending_signal || {};
+  const th = data.trading_hours || {};
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
@@ -1655,6 +1737,9 @@ function renderStats(data){
         <div class="section-label">Daily Trade Guarantee</div>
         <div class="kv"><span class="k">Status</span><span class="v">${dg.enabled ? 'Enabled' : 'Disabled'} @ ${String(dg.force_hour).padStart(2,'0')}:${String(dg.force_minute).padStart(2,'0')}</span></div>
         <div class="kv"><span class="k">Traded today</span><span class="v">${dg.traded_today ? 'Yes' : 'No'}</span></div>
+
+        <div class="section-label">Trading Hours</div>
+        <div class="kv"><span class="k">Window</span><span class="v">${th.enabled ? `${String(th.start_hour).padStart(2,'0')}:${String(th.start_minute).padStart(2,'0')}-${String(th.end_hour).padStart(2,'0')}:${String(th.end_minute).padStart(2,'0')}` : 'Off (24h)'}</span></div>
 
         <div class="section-label">Recent Trades</div>
         <div class="scroll-x">

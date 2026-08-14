@@ -131,6 +131,34 @@ GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() 
 FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 11))    # 0-23, in FORCE_TIMEZONE (see NOTE above)
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
 
+# Mirrors the indicator's "Require RSI + Extension Filters to Agree Before
+# Forcing" input. When true (the default), a forced entry does NOT fire
+# the instant FORCE_HOUR:FORCE_MINUTE passes -- it keeps checking every
+# bar and only fires once the chosen forced direction also passes the
+# same RSI-not-extreme and not-overextended-from-Fast-EMA checks organic
+# trades already require. This is what stops "fake" forced entries --
+# firing into an already-exhausted spike or overbought/oversold reading
+# just because the clock hit the force time. Set to false to revert to
+# the original behavior (fire immediately at Force-Entry Time regardless
+# of RSI/extension).
+FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "true"
+
+# If quality conditions above are still not met by this hour:minute (in
+# FORCE_TIMEZONE), this is the last chance for the day. What happens then
+# depends on FORCE_SKIP_IF_NEVER_VALID below. Only relevant when
+# FORCE_REQUIRE_QUALITY_FILTERS is true.
+FORCE_HARD_HOUR   = int(os.environ.get("FORCE_HARD_HOUR", 23))
+FORCE_HARD_MINUTE = int(os.environ.get("FORCE_HARD_MINUTE", 45))
+
+# false (default): at the hard cutoff, force the trade anyway even if
+# RSI/extension still disagree -- preserves the original "guarantee"
+# behavior of always getting >=1 trade/day.
+# true: if quality conditions were never met by the hard cutoff, skip the
+# forced entry entirely for that day (no forced trade at all) rather than
+# knowingly forcing a bad one. Only relevant when
+# FORCE_REQUIRE_QUALITY_FILTERS is true.
+FORCE_SKIP_IF_NEVER_VALID = os.environ.get("FORCE_SKIP_IF_NEVER_VALID", "false").lower() == "true"
+
 # ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
 # Pine inputs: atrLen=12, slMult=1.0, slMinPts=10, slMaxPts=10,
 #              rr1=1.9, rr2=2.7, rr3=3.5, rr4=4.0
@@ -417,6 +445,8 @@ DEFAULT_STATE = {
     "current_day": None,       # "YYYY-MM-DD" of the last bar we processed, in FORCE_TIMEZONE
     "traded_today": False,     # flips true the instant ANY trade (organic or forced) opens
     "force_attempted_today": False,  # true once we've made our one forced-entry attempt today
+    "force_skipped_today": False,  # mirrors forceSkippedTdy: latches true once we've decided to
+                                    # skip the day's forced entry rather than force a low-quality one
     # --- Pullback Confirmation tracking (mirrors pendingLong / pendingShort / pendingBar) ---
     "pending_dir": None,        # 1 (armed long), -1 (armed short), or None
     "pending_bar_time": None,   # datetime string of the bar that armed the pending signal
@@ -891,23 +921,38 @@ def roll_daily_guarantee_state(state, bar_dt):
         state["current_day"] = day_str
         state["traded_today"] = False
         state["force_attempted_today"] = False
+        state["force_skipped_today"] = False
 
 
-def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_last):
+def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_last,
+                         rsi_val, extension_atr):
     """
-    Mirrors the indicator's forceEntryNow / forceDirection logic exactly:
+    Mirrors the indicator's forceEntryNow / forceDirection logic exactly,
+    INCLUDING the RSI + Extension quality gate and hard-cutoff behavior:
 
-      isPastForceTime = (hour*60+minute) >= (forceHour*60+forceMinute)
-      forceEntryNow    = guaranteeDailyTrade and isPastForceTime
-                          and not forceAttemptedTdy and not tradedToday
-                          and flat and not entriesBlocked (weekend OR
-                          outside trading hours)
-      forceDirection   = entry-TF Supertrend, else HTF Supertrend,
-                          else EMA position (always resolves to +-1)
+      forceDirection    = entry-TF Supertrend, else HTF Supertrend,
+                           else EMA position (always resolves to +-1)
+      isPastForceTime    = (hour*60+minute) >= (forceHour*60+forceMinute)
+      isPastHardTime     = (hour*60+minute) >= (forceHardHour*60+forceHardMinute)
+      forceRsiOk         = not useRSI or (forceDirection==1 ? rsi < rsiOB : rsi > rsiOS)
+      forceExtensionOk   = not useExtensionFilter or extensionATR <= maxExtensionATR
+      forceQualityOk     = not forceRequireQualityFilters or (forceRsiOk and forceExtensionOk)
+      -- if isPastHardTime and not forceQualityOk and forceRequireQualityFilters
+         and forceSkipIfNeverValid and not tradedToday: forceSkippedTdy := true
+      forceCanFireNow    = forceQualityOk or (isPastHardTime and not forceSkipIfNeverValid)
+      forceEntryNow      = guaranteeDailyTrade and isPastForceTime
+                           and not forceAttemptedTdy and not tradedToday
+                           and flat and not entriesBlocked (weekend OR
+                           outside trading hours) and forceCanFireNow
+                           and not forceSkippedTdy
 
     bar_dt is already localized to FORCE_TIMEZONE (Twelve Data's `timezone`
     param does this at fetch time), so bar_dt.hour/bar_dt.minute here mean
     "9:00" = 9:00am in FORCE_TIMEZONE, not exchange time.
+
+    Mutates state["force_skipped_today"] in place (matches the indicator's
+    forceSkippedTdy latch), exactly like roll_pullback_state() mutates
+    pending_dir/pending_bar_time in place.
 
     Returns (force_entry_now: bool, force_direction: int [1 or -1]).
     """
@@ -918,20 +963,34 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
     if blocked:
         return False, 0
 
-    is_past_force_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HOUR * 60 + FORCE_MINUTE)
-    force_entry_now = (
-        is_past_force_time
-        and not state["force_attempted_today"]
-        and not state["traded_today"]
-        and state["position"] is None
-    )
-
     if st_dir == 1 or st_dir == -1:
         force_direction = st_dir
     elif htf_dir == 1 or htf_dir == -1:
         force_direction = htf_dir
     else:
         force_direction = 1 if ema_fast_last >= ema_slow_last else -1
+
+    is_past_force_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HOUR * 60 + FORCE_MINUTE)
+    is_past_hard_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HARD_HOUR * 60 + FORCE_HARD_MINUTE)
+
+    force_rsi_ok = (not USE_RSI) or (rsi_val < RSI_OB if force_direction == 1 else rsi_val > RSI_OS)
+    force_extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
+    force_quality_ok = (not FORCE_REQUIRE_QUALITY_FILTERS) or (force_rsi_ok and force_extension_ok)
+
+    if (is_past_hard_time and not force_quality_ok and FORCE_REQUIRE_QUALITY_FILTERS
+            and FORCE_SKIP_IF_NEVER_VALID and not state["traded_today"]):
+        state["force_skipped_today"] = True
+
+    force_can_fire_now = force_quality_ok or (is_past_hard_time and not FORCE_SKIP_IF_NEVER_VALID)
+
+    force_entry_now = (
+        is_past_force_time
+        and not state["force_attempted_today"]
+        and not state["traded_today"]
+        and state["position"] is None
+        and force_can_fire_now
+        and not state.get("force_skipped_today", False)
+    )
 
     return force_entry_now, force_direction
 
@@ -1124,6 +1183,7 @@ def check():
         force_entry_now, force_direction = compute_force_entry(
             state, last["datetime"], int(last["st_dir"]), htf_dir,
             last["emaFast"], last["emaSlow"],
+            last["rsi"], extension_atr,
         )
         force_long_cond = force_entry_now and force_direction == 1
         force_short_cond = force_entry_now and force_direction == -1
@@ -1244,6 +1304,11 @@ def stats():
             "current_day": state.get("current_day"),
             "traded_today": state.get("traded_today"),
             "force_attempted_today": state.get("force_attempted_today"),
+            "force_skipped_today": state.get("force_skipped_today", False),
+            "require_quality_filters": FORCE_REQUIRE_QUALITY_FILTERS,
+            "hard_cutoff_hour": FORCE_HARD_HOUR,
+            "hard_cutoff_minute": FORCE_HARD_MINUTE,
+            "skip_if_never_valid": FORCE_SKIP_IF_NEVER_VALID,
         },
         "pending_signal": {
             "dir": state.get("pending_dir"),
@@ -1335,6 +1400,10 @@ def health():
         "force_hour": FORCE_HOUR,
         "force_minute": FORCE_MINUTE,
         "force_timezone": FORCE_TIMEZONE,
+        "force_require_quality_filters": FORCE_REQUIRE_QUALITY_FILTERS,
+        "force_hard_hour": FORCE_HARD_HOUR if FORCE_REQUIRE_QUALITY_FILTERS else None,
+        "force_hard_minute": FORCE_HARD_MINUTE if FORCE_REQUIRE_QUALITY_FILTERS else None,
+        "force_skip_if_never_valid": FORCE_SKIP_IF_NEVER_VALID,
         "disable_weekend_signals": DISABLE_WEEKEND_SIGNALS,
         "use_trading_hours": USE_TRADING_HOURS,
         "trading_start": f"{TRADING_START_HOUR:02d}:{TRADING_START_MINUTE:02d}" if USE_TRADING_HOURS else None,

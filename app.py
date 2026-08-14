@@ -38,156 +38,67 @@ TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart ti
 FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 
 # ---------------------- WEEKEND GUARD ----------------------
-# The market (XAU/USD spot) is closed over the weekend. When enabled (the
-# default), the bot will NOT open any NEW signal -- organic or forced by
-# the Daily Trade Guarantee -- while the current bar's calendar day (in
-# FORCE_TIMEZONE) is a Saturday or Sunday. It still manages/closes any
-# already-open position against incoming bars, in case your feed still
-# ticks over the weekend. Set DISABLE_WEEKEND_SIGNALS=false to turn this
-# off again.
 DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lower() == "true"
 
 # ---------------------- TRADING HOURS GUARD ----------------------
-# Mirrors the indicator's "Trading Hours" filter in the Session Filter
-# group. When enabled (the default), the bot will NOT open any NEW signal
-# -- organic, pullback, or Forced Daily -- outside the daily window below,
-# evaluated in FORCE_TIMEZONE (Cambodia by default). Default window is
-# 06:30-23:59, so nothing fires overnight while you're asleep. It still
-# manages/closes any already-open position outside the window; this only
-# blocks opening NEW trades, exactly like the weekend guard, and it stacks
-# with the weekend guard rather than replacing it. Set
-# USE_TRADING_HOURS=false to trade 24 hours a day again.
 USE_TRADING_HOURS   = os.environ.get("USE_TRADING_HOURS", "true").lower() == "true"
 TRADING_START_HOUR   = int(os.environ.get("TRADING_START_HOUR", 6))
 TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
 TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 23))
 TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 
-KEY_STATE_FILE = "api_key_state.json"  # persists rotation index + per-key daily usage across polls
+KEY_STATE_FILE = "api_key_state.json"
 
-# ---------------------- SIGNAL ENGINE PARAMETERS (exact indicator defaults) ----------------------
-# Pine inputs: fastLen=27, slowLen=32, useRSI=true, rsiLen=15, rsiOB=70, rsiOS=30
+# ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
 FAST_LEN = 30
 SLOW_LEN = 32
 USE_RSI = True
 RSI_LEN = 16
-RSI_OB = 70   # block buys above this
-RSI_OS = 30   # block sells below this
+RSI_OB = 70
+RSI_OS = 30
 
-# ---------------------- SUPERTREND TREND FILTER (exact indicator defaults) ----------------------
-# Pine inputs: stAtrPeriod=8, stFactor=2.0
+# ---------------------- SUPERTREND TREND FILTER ----------------------
 ST_ATR_PERIOD = 8
 ST_FACTOR = 2.0
-# Require a Supertrend flip to hold this many bars before it's tradeable
-# (matches indicator's "stConfirmBars" input, default 1).
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
 
-# ---------------------- HIGHER TIMEFRAME CONFIRMATION (exact indicator defaults) ----------------------
-# Matches the indicator's "Higher Timeframe Confirmation" group. Only takes
-# BUY signals when the HTF Supertrend is bullish, only takes SELL signals
-# when it's bearish.
+# ---------------------- HIGHER TIMEFRAME CONFIRMATION ----------------------
 USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
-# Twelve Data interval strings, NOT Pine's "240" minute-count style.
-# Indicator default is "240" minutes -> Twelve Data equivalent is "4h".
 HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "4h")
 HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 4))
 HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 
-# ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION (exact indicator defaults) ----------------------
-# Mirrors the indicator's "Entry Timing (Pullback Confirmation)" group.
-# Instead of entering the instant the EMA cross + RSI + Supertrend + HTF
-# stack all agree ("the base condition"), that agreement only ARMS a
-# pending signal. The trade is only actually opened once price retraces
-# back within PULLBACK_MAX_ATR of the Fast EMA (while the trend filters
-# still agree), or the pending signal is dropped if it hasn't pulled back
-# within PULLBACK_TIMEOUT_BARS bars.
-#
-# Because this bot polls periodically (it doesn't walk bar-by-bar like the
-# Pine script does on a chart), the "armed" state has to be persisted in
-# state.json across polls, and re-anchored to the current bar's position in
-# the freshly-fetched candle window every time /check runs. See
-# roll_pullback_state() below.
+# ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION ----------------------
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
 PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.4))
 PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 8))
 
-# Overextension filter: blocks ANY organic entry (pullback or immediate
-# mode) if price is currently too far from the Fast EMA in ATR terms —
-# the "already extended, about to mean-revert" state the indicator's
-# changelog calls out as the cause of its losing SELLs.
 USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
 MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.5))
 
-# ---------------------- DAILY TRADE GUARANTEE (exact indicator defaults) ----------------------
-# Matches the indicator's "Daily Trade Guarantee" group. If nothing organic
-# has opened a trade yet today by FORCE_HOUR:FORCE_MINUTE (evaluated in
-# FORCE_TIMEZONE, default Cambodia/UTC+7 — see NOTE at top of file), force
-# one entry in the direction of the prevailing trend so every day gets >= 1
-# trade. This is a SEPARATE, clearly-tagged fallback — it never loosens the
-# organic EMA/RSI/Supertrend/HTF/pullback/extension stack above. It is also
-# subject to the weekend guard AND the trading-hours guard above, so it
-# will not fire on Sat/Sun or outside the trading-hours window.
+# ---------------------- DAILY TRADE GUARANTEE ----------------------
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
-FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 11))    # 0-23, in FORCE_TIMEZONE (see NOTE above)
-FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))  # 0-59
+FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 11))
+FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))
 
-# Mirrors the indicator's "Require RSI + Extension Filters to Agree Before
-# Forcing" input. When true (the default), a forced entry does NOT fire
-# the instant FORCE_HOUR:FORCE_MINUTE passes -- it keeps checking every
-# bar and only fires once the chosen forced direction also passes the
-# same RSI-not-extreme and not-overextended-from-Fast-EMA checks organic
-# trades already require. This is what stops "fake" forced entries --
-# firing into an already-exhausted spike or overbought/oversold reading
-# just because the clock hit the force time. Set to false to revert to
-# the original behavior (fire immediately at Force-Entry Time regardless
-# of RSI/extension).
 FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "true"
 
-# If quality conditions above are still not met by this hour:minute (in
-# FORCE_TIMEZONE), this is the last chance for the day. What happens then
-# depends on FORCE_SKIP_IF_NEVER_VALID below. Only relevant when
-# FORCE_REQUIRE_QUALITY_FILTERS is true.
 FORCE_HARD_HOUR   = int(os.environ.get("FORCE_HARD_HOUR", 23))
 FORCE_HARD_MINUTE = int(os.environ.get("FORCE_HARD_MINUTE", 45))
 
-# false (default): at the hard cutoff, force the trade anyway even if
-# RSI/extension still disagree -- preserves the original "guarantee"
-# behavior of always getting >=1 trade/day.
-# true: if quality conditions were never met by the hard cutoff, skip the
-# forced entry entirely for that day (no forced trade at all) rather than
-# knowingly forcing a bad one. Only relevant when
-# FORCE_REQUIRE_QUALITY_FILTERS is true.
 FORCE_SKIP_IF_NEVER_VALID = os.environ.get("FORCE_SKIP_IF_NEVER_VALID", "false").lower() == "true"
 
-# ---------------------- RISK MANAGEMENT (exact indicator defaults) ----------------------
-# Pine inputs: atrLen=12, slMult=1.0, slMinPts=10, slMaxPts=10,
-#              rr1=1.9, rr2=2.7, rr3=3.5, rr4=4.0
+# ---------------------- RISK MANAGEMENT ----------------------
 ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
 RR1, RR2, RR3, RR4 = 1.9, 2.5, 2.5, 3.5
 
-# "tp1_only" | "first_hit" | "partial"  (matches the indicator's pnlMode dropdown)
-# Pine's default is "Ratchet SL (Book Once: BE -> TP1 -> TP2 -> TP4)" -> "partial"
-# here (the name "partial" is legacy — nothing is actually partially closed,
-# see the big note on ratchet_to_breakeven/ratchet_to_tp1/ratchet_to_tp2
-# below — the position stays full size the whole time and exactly ONE
-# dollar figure is ever booked per trade, matching the indicator's
-# closeTrade()).
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
-# ---------------------- RUNNER MANAGEMENT ----------------------
-# NOTE: as of the TP1/TP2/TP3/TP4 fixed-payout + manual SL-ladder change
-# below, the runner leg (after TP1+TP2+TP3 are booked) no longer trails the
-# SL to the live Supertrend value. Instead the SL sits fixed at TP2 (moved
-# there when TP3 was booked) until TP4 is hit, at which point the whole
-# position is closed. USE_TRAILING_RUNNER / trail_runner_sl() are kept in
-# the file for reference but are no longer called anywhere in
-# manage_position().
-USE_TRAILING_RUNNER = True  # no longer used by the runner leg (see note above)
+USE_TRAILING_RUNNER = True
 
-# ---------------------- POSITION SIZING (exact indicator defaults) ----------------------
 LOT_SIZE = float(os.environ.get("LOT_SIZE", 0.01))
 UNITS_PER_LOT = float(os.environ.get("UNITS_PER_LOT", 100))
 
@@ -203,7 +114,6 @@ def _load_key_state():
     else:
         ks = {}
     if ks.get("date") != today:
-        # new UTC day -> reset per-key usage counters
         ks = {"date": today, "next_index": 0, "usage": {}}
     ks.setdefault("next_index", 0)
     ks.setdefault("usage", {})
@@ -220,23 +130,6 @@ def _key_label(i):
 
 
 def fetch_candles(interval, outputsize=5000, credits_per_call=3):
-    """
-    Fetches candles from Twelve Data, rotating across up to 3 configured API
-    keys. Each call advances the rotation by one key (round-robin), and
-    tracks approximate credit usage per key per UTC day in KEY_STATE_FILE
-    purely for visibility via /keys. If a key comes back rate-limited (HTTP
-    429 or a Twelve Data error payload mentioning the limit), it
-    automatically retries the SAME request on the next key instead of
-    failing the whole /check call.
-
-    Passes `timezone=FORCE_TIMEZONE` on every request so the returned
-    "datetime" values are pre-localized to that zone (see the NOTE at the
-    top of this file) — this is what makes the Daily Trade Guarantee's
-    FORCE_HOUR/FORCE_MINUTE and day-boundary checks (and the trading-hours
-    guard's start/end checks) correct for Cambodia (or whatever
-    FORCE_TIMEZONE is set to) regardless of the underlying exchange feed's
-    own timezone.
-    """
     if not TWELVE_DATA_API_KEYS:
         raise RuntimeError("No Twelve Data API key configured. Set TWELVE_DATA_API_KEY_1 (and optionally _2 / _3).")
 
@@ -269,8 +162,6 @@ def fetch_candles(interval, outputsize=5000, credits_per_call=3):
         )
 
         if "values" in data:
-            # success on this key -> record usage, advance rotation past it,
-            # persist, and return
             label = _key_label(idx)
             ks["usage"][label] = ks["usage"].get(label, 0) + credits_per_call
             ks["next_index"] = (idx + 1) % n
@@ -285,11 +176,7 @@ def fetch_candles(interval, outputsize=5000, credits_per_call=3):
 
         last_error = data
         if not rate_limited:
-            # A non-rate-limit error (bad symbol, bad interval, bad
-            # timezone name, etc.) will fail the same way on every key, so
-            # don't bother rotating.
             break
-        # else: rate-limited -> loop continues and tries the next key
 
     raise RuntimeError(f"Twelve Data error for {interval} (tried {min(attempt + 1, n)} key(s)): {last_error}")
 
@@ -324,12 +211,6 @@ def atr(df, length):
 
 
 def supertrend(df, period, factor):
-    """
-    Classic Supertrend, mirrors Pine's ta.supertrend(factor, period).
-    Returns (supertrend_series, direction_series) where direction == 1
-    means bullish/uptrend (Pine's stDirection < 0) and direction == -1
-    means bearish/downtrend (Pine's stDirection > 0).
-    """
     hl2 = (df["high"] + df["low"]) / 2
     atr_val = true_range(df).ewm(alpha=1 / period, adjust=False).mean()
     upperband = hl2 + factor * atr_val
@@ -372,12 +253,6 @@ def supertrend(df, period, factor):
 
 
 def bars_since_supertrend_flip(dir_series):
-    """
-    Mirrors the indicator's stFlipBar / barsSinceFlip logic: walks backward
-    from the last bar counting how many consecutive bars have held the
-    CURRENT direction. 0 means the current bar IS the flip bar (direction
-    just changed this bar); 1 means it held for one bar after the flip, etc.
-    """
     n = len(dir_series)
     if n == 0:
         return 9999
@@ -388,7 +263,7 @@ def bars_since_supertrend_flip(dir_series):
             count += 1
         else:
             break
-    return count - 1  # bars since flip (matches Pine's bar_index - stFlipBar)
+    return count - 1
 
 
 def trend_arrow(d):
@@ -396,21 +271,10 @@ def trend_arrow(d):
 
 
 def is_weekend_bar(bar_dt):
-    """
-    True when bar_dt (already localized to FORCE_TIMEZONE by fetch_candles'
-    timezone= param) falls on a Saturday or Sunday. pandas/Python weekday()
-    is 0=Monday ... 5=Saturday, 6=Sunday.
-    """
     return bar_dt.weekday() >= 5
 
 
 def is_outside_trading_hours(bar_dt):
-    """
-    True when bar_dt (already localized to FORCE_TIMEZONE) falls outside
-    the [TRADING_START_HOUR:TRADING_START_MINUTE, TRADING_END_HOUR:TRADING_END_MINUTE]
-    window. Mirrors the indicator's isWithinTradingHours/outsideTradingHours
-    logic exactly. Always False when USE_TRADING_HOURS is off.
-    """
     if not USE_TRADING_HOURS:
         return False
     minutes_now = bar_dt.hour * 60 + bar_dt.minute
@@ -420,12 +284,6 @@ def is_outside_trading_hours(bar_dt):
 
 
 def is_new_entries_blocked(bar_dt):
-    """
-    Combined gate mirroring the indicator's `entriesBlocked` (weekend OR
-    outside trading hours). Used everywhere a NEW entry (organic, pullback,
-    or Forced Daily) is considered. Never affects management of an already
-    open position.
-    """
     weekend = DISABLE_WEEKEND_SIGNALS and is_weekend_bar(bar_dt)
     outside_hours = is_outside_trading_hours(bar_dt)
     return weekend, outside_hours, (weekend or outside_hours)
@@ -434,22 +292,19 @@ def is_new_entries_blocked(bar_dt):
 # ---------------------- STATE ----------------------
 DEFAULT_STATE = {
     "last_signal_bar": None,
-    "last_exit_bar": None,
+    "last_closed_bar_time": None,
     "position": None,
     "history": [],
     "stats": {
         "total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
         "best_trade": None, "worst_trade": None,
     },
-    # --- Daily Trade Guarantee tracking (mirrors tradedToday / forceAttemptedTdy) ---
-    "current_day": None,       # "YYYY-MM-DD" of the last bar we processed, in FORCE_TIMEZONE
-    "traded_today": False,     # flips true the instant ANY trade (organic or forced) opens
-    "force_attempted_today": False,  # true once we've made our one forced-entry attempt today
-    "force_skipped_today": False,  # mirrors forceSkippedTdy: latches true once we've decided to
-                                    # skip the day's forced entry rather than force a low-quality one
-    # --- Pullback Confirmation tracking (mirrors pendingLong / pendingShort / pendingBar) ---
-    "pending_dir": None,        # 1 (armed long), -1 (armed short), or None
-    "pending_bar_time": None,   # datetime string of the bar that armed the pending signal
+    "current_day": None,
+    "traded_today": False,
+    "force_attempted_today": False,
+    "force_skipped_today": False,
+    "pending_dir": None,
+    "pending_bar_time": None,
 }
 
 
@@ -478,8 +333,6 @@ def send_telegram(text):
 
 
 def _notify_requested():
-    """True when the caller asked for the result to also be pushed to
-    Telegram, e.g. GET /check?notify=1 or GET /stats?notify=true."""
     val = request.args.get("notify", "").strip().lower()
     return val in ("1", "true", "yes", "on")
 
@@ -495,11 +348,6 @@ def _fmt_money(v):
 
 
 def build_check_telegram_message(result, state):
-    """Builds a '[Manual Check]' summary for the dashboard's 'send to
-    Telegram' toggle on /check. This is DELIBERATELY separate from the
-    automatic entry/exit alerts fired inside manage_position()/the entry
-    block above, so a manual dashboard check never gets confused with a
-    real automated signal — it's always clearly tagged."""
     lines = ["📊 [Manual Check] XAUUSD", f"Bar: {result.get('bar_time')} ({FORCE_TIMEZONE})"]
 
     event = result.get("event")
@@ -535,8 +383,6 @@ def build_check_telegram_message(result, state):
 
 
 def build_stats_telegram_message(payload, state):
-    """Builds a '[Manual Stats]' summary for the dashboard's 'send to
-    Telegram' toggle on /stats."""
     lines = [
         "📈 [Manual Stats] XAUUSD Bot",
         f"Win rate: {payload['win_rate']}% ({payload['wins']}W / {payload['losses']}L / {payload['total_trades']} total)",
@@ -572,18 +418,6 @@ def build_stats_telegram_message(payload, state):
 
 # ---------------------- TRADE LOG ----------------------
 def log_trade(state, side, entry, sl, tp1, tp2, tp3, tp4, exit_price, result, points, pnl):
-    """Writes exactly ONE row to the trade log AND adds pnl to sum_pnl.
-
-    IMPORTANT: this is the ONLY place P&L should ever be booked. It is
-    called from settle_trade() alone. Do NOT call this from the ratchet
-    helpers (ratchet_to_breakeven / ratchet_to_tp1 / ratchet_to_tp2) below —
-    those only move the stop loss and must never add to sum_pnl or write a
-    log row, exactly like the Pine indicator's ratchetToBreakeven() /
-    ratchetToTP1() / ratchetToTP2(), which only call line.set_y1/y2 and
-    never call closeTrade(). Calling log_trade() from a ratchet step would
-    double-book profit (once at the ratchet, again when the position
-    finally closes) — see the fix note near ratchet_to_breakeven() below.
-    """
     state["history"].insert(0, {
         "side": side, "entry": entry, "sl": sl,
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "exit": exit_price,
@@ -594,22 +428,6 @@ def log_trade(state, side, entry, sl, tp1, tp2, tp3, tp4, exit_price, result, po
 
 
 def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
-    """Fully closes the position and settles win/loss stats. This is the
-    ONLY function that ever books P&L / writes a trade-log row (matches the
-    Pine indicator's closeTrade(), which is likewise the sole place that
-    calls array.unshift(history, t) and adjusts S.sumPnl). A trade counts
-    as a win overall if this final leg was positive, OR if an earlier
-    TP1/TP2/TP3 ratchet already locked in guaranteed profit — same rule as
-    the indicator's closeTrade() (pnl >= 0 check plus the ratchet flags).
-
-    pnl_override: when provided, this exact dollar amount is booked for this
-    leg instead of deriving it from points * full position size. Used by
-    the "SL Hit (After TPx — Locked at TPy)" exits so they book the
-    TPy-level profit rather than re-deriving from the ratcheted SL price
-    relative to entry (which would give the same number, but this keeps the
-    call sites explicit and matches the indicator's approach of passing the
-    intended dollar amount straight through).
-    """
     points = (exit_price - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - exit_price)
     pnl = pnl_override if pnl_override is not None else points * LOT_SIZE * UNITS_PER_LOT
 
@@ -631,47 +449,26 @@ def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
     return pnl
 
 
-# ---------------------- RATCHET HELPERS (book-once model) ----------------------
-# FIX: these previously (as partial_close_tp1/tp2/tp3) called log_trade()
-# and added to sum_pnl on EVERY ratchet step, then settle_trade() booked
-# ANOTHER dollar amount when the trade finally closed — stacking 2-4x the
-# real profit into Net P&L and writing 2-4 trade-log rows per position.
-# That does not match the Pine indicator, which is explicit that "exactly
-# ONE dollar figure ever [gets] booked per position — never stacked."
-#
-# These functions now ONLY move the stop loss (and set the tpX_hit flag /
-# a cosmetic remaining_size used purely for the dashboard's progress
-# display). No P&L is booked and no log row is written here — that only
-# happens once, in settle_trade(), exactly mirroring the Pine indicator's
-# ratchetToBreakeven() / ratchetToTP1() / ratchetToTP2(), which only call
-# line.set_y1()/line.set_y2() and never call closeTrade().
+# ---------------------- RATCHET HELPERS ----------------------
 def ratchet_to_breakeven(pos):
-    """TP1 touched: SL -> entry (breakeven). No P&L booked yet."""
     pos["tp1_hit"] = True
-    pos["remaining_size"] = 0.75  # cosmetic only, for the dashboard
+    pos["remaining_size"] = 0.75
     pos["sl"] = pos["entry"]
 
 
 def ratchet_to_tp1(pos):
-    """TP2 touched: SL -> TP1. No P&L booked yet."""
     pos["tp2_hit"] = True
-    pos["remaining_size"] = 0.5  # cosmetic only, for the dashboard
+    pos["remaining_size"] = 0.5
     pos["sl"] = pos["tp1"]
 
 
 def ratchet_to_tp2(pos):
-    """TP3 touched: SL -> TP2. No P&L booked yet."""
     pos["tp3_hit"] = True
-    pos["remaining_size"] = 0.25  # cosmetic only, for the dashboard
+    pos["remaining_size"] = 0.25
     pos["sl"] = pos["tp2"]
 
 
 def trail_runner_sl(pos, st_value):
-    """DEPRECATED / no longer called by manage_position(). Kept only for
-    reference — previously trailed the runner's SL to the live Supertrend
-    value after TP1+TP2+TP3 were booked. The runner leg now uses a fixed
-    SL at TP2 instead of a Supertrend trail. See ratchet_to_tp2() and the
-    final-leg branch in manage_position()."""
     if st_value is None or pd.isna(st_value):
         return
     if pos["dir"] == 1 and st_value > pos["sl"]:
@@ -680,14 +477,14 @@ def trail_runner_sl(pos, st_value):
         pos["sl"] = st_value
 
 
-# ---------------------- POSITION MANAGEMENT (mirrors the Pine if-cascade) ----------------------
+# ---------------------- POSITION MANAGEMENT ----------------------
 def manage_position(state, last_candle, st_value):
     pos = state["position"]
     if pos is None:
         return False
 
     high, low = last_candle["high"], last_candle["low"]
-    events = []  # list of (label, price, pnl_or_None) — pnl is None for a pure ratchet (no booking)
+    events = []
 
     def buy_side():
         if PNL_MODE == "tp1_only":
@@ -713,7 +510,7 @@ def manage_position(state, last_candle, st_value):
             elif high >= pos["tp1"]:
                 pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
                 events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:  # partial (== ratcheting SL, book once — matches Pine's default mode)
+        else:
             if not pos["tp1_hit"]:
                 if low <= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
@@ -764,14 +561,6 @@ def manage_position(state, last_candle, st_value):
                     ratchet_to_tp2(pos)
                     events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
             else:
-                # Final runner leg: SL is fixed at TP2 (set when TP3 was
-                # booked). No more Supertrend trailing — either SL is hit
-                # (locking in the TP2 amount for this leg) or TP4 is hit
-                # (booking the full TP4 dollar value), and the position is
-                # closed either way. This is the ONLY branch that books
-                # P&L for this trade at this point (or the earlier SL/TP4
-                # branches above) — everything before this was a pure
-                # ratchet with no booking.
                 if low <= pos["sl"]:
                     points = pos["tp2"] - pos["entry"]
                     pnl = points * LOT_SIZE * UNITS_PER_LOT
@@ -807,7 +596,7 @@ def manage_position(state, last_candle, st_value):
             elif low <= pos["tp1"]:
                 pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
                 events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:  # partial (== ratcheting SL, book once — matches Pine's default mode)
+        else:
             if not pos["tp1_hit"]:
                 if high >= pos["sl"]:
                     pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
@@ -858,11 +647,6 @@ def manage_position(state, last_candle, st_value):
                     ratchet_to_tp2(pos)
                     events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
             else:
-                # Final runner leg: SL is fixed at TP2 (set when TP3 was
-                # booked). No more Supertrend trailing — either SL is hit
-                # (locking in the TP2 amount for this leg) or TP4 is hit
-                # (booking the full TP4 dollar value), and the position is
-                # closed either way.
                 if high >= pos["sl"]:
                     points = pos["entry"] - pos["tp2"]
                     pnl = points * LOT_SIZE * UNITS_PER_LOT
@@ -882,8 +666,6 @@ def manage_position(state, last_candle, st_value):
     side = "BUY" if pos["dir"] == 1 else "SELL"
     for label, price, pnl in events:
         if pnl is None:
-            # Pure ratchet step — SL moved, nothing booked yet. No dollar
-            # figure to show (there isn't one until the position closes).
             msg = (
                 f"XAUUSD {side} — {label}\n"
                 f"Price: {price:.2f}\n"
@@ -912,10 +694,6 @@ def open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time):
 
 # ---------------------- DAILY TRADE GUARANTEE HELPERS ----------------------
 def roll_daily_guarantee_state(state, bar_dt):
-    """Mirrors the indicator's `newDay` reset block: whenever the bar's
-    calendar day (in FORCE_TIMEZONE, since bar_dt comes pre-localized from
-    fetch_candles) changes vs. the last bar we processed, reset
-    traded_today / force_attempted_today for the new day."""
     day_str = bar_dt.strftime("%Y-%m-%d")
     if state.get("current_day") != day_str:
         state["current_day"] = day_str
@@ -926,36 +704,6 @@ def roll_daily_guarantee_state(state, bar_dt):
 
 def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_last,
                          rsi_val, extension_atr):
-    """
-    Mirrors the indicator's forceEntryNow / forceDirection logic exactly,
-    INCLUDING the RSI + Extension quality gate and hard-cutoff behavior:
-
-      forceDirection    = entry-TF Supertrend, else HTF Supertrend,
-                           else EMA position (always resolves to +-1)
-      isPastForceTime    = (hour*60+minute) >= (forceHour*60+forceMinute)
-      isPastHardTime     = (hour*60+minute) >= (forceHardHour*60+forceHardMinute)
-      forceRsiOk         = not useRSI or (forceDirection==1 ? rsi < rsiOB : rsi > rsiOS)
-      forceExtensionOk   = not useExtensionFilter or extensionATR <= maxExtensionATR
-      forceQualityOk     = not forceRequireQualityFilters or (forceRsiOk and forceExtensionOk)
-      -- if isPastHardTime and not forceQualityOk and forceRequireQualityFilters
-         and forceSkipIfNeverValid and not tradedToday: forceSkippedTdy := true
-      forceCanFireNow    = forceQualityOk or (isPastHardTime and not forceSkipIfNeverValid)
-      forceEntryNow      = guaranteeDailyTrade and isPastForceTime
-                           and not forceAttemptedTdy and not tradedToday
-                           and flat and not entriesBlocked (weekend OR
-                           outside trading hours) and forceCanFireNow
-                           and not forceSkippedTdy
-
-    bar_dt is already localized to FORCE_TIMEZONE (Twelve Data's `timezone`
-    param does this at fetch time), so bar_dt.hour/bar_dt.minute here mean
-    "9:00" = 9:00am in FORCE_TIMEZONE, not exchange time.
-
-    Mutates state["force_skipped_today"] in place (matches the indicator's
-    forceSkippedTdy latch), exactly like roll_pullback_state() mutates
-    pending_dir/pending_bar_time in place.
-
-    Returns (force_entry_now: bool, force_direction: int [1 or -1]).
-    """
     if not GUARANTEE_DAILY_TRADE:
         return False, 0
 
@@ -995,16 +743,8 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
     return force_entry_now, force_direction
 
 
-# ---------------------- ENTRY TIMING HELPERS (Pullback Confirmation) ----------------------
+# ---------------------- ENTRY TIMING HELPERS ----------------------
 def bars_since_pending_armed(df, pending_bar_time):
-    """
-    Finds the row in the freshly-fetched df matching the bar that armed the
-    pending signal, and returns how many bars have elapsed since then
-    (0 = armed on the current/last bar). If the armed bar has fallen out of
-    the fetched window (too old), returns a large number so the caller
-    treats it as timed out — mirrors what would happen on a real chart if
-    price never pulled back for that long.
-    """
     if pending_bar_time is None:
         return None
     target = pd.to_datetime(pending_bar_time)
@@ -1016,22 +756,6 @@ def bars_since_pending_armed(df, pending_bar_time):
 
 def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
                          base_long_cond, base_short_cond, entries_blocked=False):
-    """
-    Mirrors the indicator's pending-signal block:
-
-      if baseLongCond:  pendingLong := true,  pendingShort := false
-      if baseShortCond: pendingShort := true, pendingLong := false
-      if pendingLong  and (not stBullish or not htfBullish or timeout or entriesBlocked): pendingLong := false
-      if pendingShort and (not stBearish or not htfBearish or timeout or entriesBlocked): pendingShort := false
-
-    entries_blocked mirrors the indicator's combined weekend-OR-outside-
-    trading-hours gate: a pending signal is cancelled outright the moment
-    it goes true, exactly like the weekend cancellation already did, so a
-    signal armed right before the trading window closes can't silently
-    fire once you're asleep.
-
-    Mutates state["pending_dir"] / state["pending_bar_time"] in place.
-    """
     if base_long_cond:
         state["pending_dir"] = 1
         state["pending_bar_time"] = bar_time
@@ -1074,49 +798,64 @@ def check():
     state = load_state()
     result = {"bar_time": bar_time, "event": None}
 
-    # 0) Roll the Daily Trade Guarantee's day-tracking forward if this bar
-    #    is a new calendar day IN FORCE_TIMEZONE (mirrors the indicator's
-    #    `newDay` reset, now anchored to Cambodia/FORCE_TIMEZONE rather than
-    #    the raw exchange feed timezone).
-    roll_daily_guarantee_state(state, last["datetime"])
-
-  # 1) Manage the position against EVERY bar since the last time we
-    #    checked, not just the latest one -- catches SL/TP touches that
-    #    happened on bars skipped by an infrequent poll.
-    last_managed_str = state.get("last_managed_bar_time")
-    if last_managed_str:
-        unmanaged_bars = df[df["datetime"] > pd.to_datetime(last_managed_str)]
-        if len(unmanaged_bars) == 0:
-            unmanaged_bars = df.iloc[[-1]]
+    # ---------------------------------------------------------------
+    # LAG FIX (v2): the previous version of this endpoint (and the first
+    # patch of this fix) deduped position-management by bar timestamp --
+    # "if we've already processed this bar_time, skip." That's wrong for
+    # the CURRENT bar: Twelve Data returns the still-forming candle with a
+    # live-updating high/low as price moves inside it, so a 5min timeframe
+    # polled every 2min shows the SAME bar timestamp 2-3 times before that
+    # candle finally closes. Deduping by timestamp meant only the FIRST
+    # poll of that candle ever checked its high/low against SL/TP -- every
+    # later poll (where the candle's low had actually dropped further, or
+    # high risen further) was skipped entirely. That's exactly how an SL
+    # can visibly trade through on the live chart while the bot still
+    # shows the position open.
+    #
+    # Fix: split management into two passes.
+    #   (a) Backfill fully CLOSED bars we haven't processed yet (covers a
+    #       poller outage/slow cron skipping whole bars) -- deduped by
+    #       state["last_closed_bar_time"] since closed bars never change.
+    #   (b) ALWAYS re-check the current (possibly still-forming) last bar
+    #       on every single poll, no dedup -- this is what actually catches
+    #       an SL/TP touched mid-candle. manage_position() is safe to call
+    #       repeatedly: it only acts on tp1_hit/tp2_hit/tp3_hit flags and a
+    #       monotonically growing high/low, so re-checking the same
+    #       (bigger) high/low again can't double-fire or un-trigger
+    #       anything.
+    # ---------------------------------------------------------------
+    last_closed_str = state.get("last_closed_bar_time")
+    if last_closed_str and len(df) > 1:
+        last_closed_ts = pd.to_datetime(last_closed_str)
+        closed_backlog = df.iloc[:-1]
+        closed_backlog = closed_backlog[closed_backlog["datetime"] > last_closed_ts]
     else:
-        unmanaged_bars = df.iloc[[-1]]
+        closed_backlog = df.iloc[0:0]
 
     any_managed_event = False
-    for _, bar in unmanaged_bars.iterrows():
+
+    # (a) backfill any closed bars we haven't processed yet
+    for _, bar in closed_backlog.iterrows():
         roll_daily_guarantee_state(state, bar["datetime"])
         if state["position"] is not None:
             any_managed_event = manage_position(state, bar, bar["st"]) or any_managed_event
-        state["last_managed_bar_time"] = str(bar["datetime"])
+        state["last_closed_bar_time"] = str(bar["datetime"])
+
+    # (b) always re-check the current/latest bar, dedup or not
+    roll_daily_guarantee_state(state, last["datetime"])
+    if state["position"] is not None:
+        any_managed_event = manage_position(state, last, last["st"]) or any_managed_event
 
     if any_managed_event:
         result["event"] = "position_update"
-    state["last_exit_bar"] = bar_time
     save_state(state)
 
     # 1b) Session guard: don't evaluate/open any NEW signal (organic or
     #     forced) while the current bar is a Saturday/Sunday in
     #     FORCE_TIMEZONE, OR while it's outside the configured trading-hours
-    #     window (default 06:30-23:59 FORCE_TIMEZONE, so nothing fires
-    #     overnight while you're asleep). Still update last_signal_bar so we
-    #     don't just spin re-checking the same closed bar. Also explicitly
-    #     clears any pending pullback signal that was armed before the
-    #     block started -- this mirrors the indicator's "entriesBlocked"
-    #     cancellation of pendingLong/pendingShort, so a signal armed just
-    #     before the window closes (or the weekend starts) can never
-    #     silently fire once you're asleep / once markets are shut. Without
-    #     this it would simply have been *frozen* (never re-evaluated) and
-    #     left to expire on its own via the pullback timeout, which usually
-    #     resolves the same way but wasn't a guaranteed match.
+    #     window. Still update last_signal_bar so we don't just spin
+    #     re-checking the same closed bar. Also explicitly clears any
+    #     pending pullback signal that was armed before the block started.
     weekend_now, outside_hours_now, blocked_now = is_new_entries_blocked(last["datetime"])
     if blocked_now:
         state["last_signal_bar"] = bar_time
@@ -1141,11 +880,9 @@ def check():
         st_bullish = last["st_dir"] == 1
         st_bearish = last["st_dir"] == -1
 
-        # --- Supertrend flip-confirmation (matches indicator's stFlipConfirmed) ---
         bars_since_flip = bars_since_supertrend_flip(dir_series)
         st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
 
-        # --- Higher-timeframe Supertrend confirmation (matches useHTF) ---
         htf_dir = 0
         if USE_HTF:
             htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=500)
@@ -1154,30 +891,20 @@ def check():
         htf_bullish = (not USE_HTF) or htf_dir == 1
         htf_bearish = (not USE_HTF) or htf_dir == -1
 
-        # --- Overextension filter (matches useExtensionFilter/extensionOk) ---
         extension_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
         extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
 
-        # --- Pullback distance (matches pullbackDistATR/pullbackOk) ---
         pullback_dist_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
         pullback_ok = pullback_dist_atr <= PULLBACK_MAX_ATR
 
-        # --- Base condition: the whole filter stack agrees (matches
-        #     baseLongCond / baseShortCond). This is what ARMS a pending
-        #     signal, and (in immediate mode) is also the entry condition. ---
         base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
         base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
 
-        # --- Arm / cancel the pending pullback signal (matches the
-        #     indicator's pendingLong/pendingShort block). blocked_now is
-        #     always False here (we're inside the `not blocked_now` branch)
-        #     but is passed through for symmetry with the indicator's gate. ---
         roll_pullback_state(
             state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
             base_long_cond, base_short_cond, entries_blocked=blocked_now,
         )
 
-        # --- Organic entry conditions (matches longCond/shortCond) ---
         if USE_PULLBACK_ENTRY:
             long_cond = (
                 extension_ok and state["pending_dir"] == 1 and pullback_ok
@@ -1191,7 +918,6 @@ def check():
             long_cond = extension_ok and base_long_cond
             short_cond = extension_ok and base_short_cond
 
-        # --- Daily Trade Guarantee: forced fallback entry (matches forceEntryNow/forceDirection) ---
         force_entry_now, force_direction = compute_force_entry(
             state, last["datetime"], int(last["st_dir"]), htf_dir,
             last["emaFast"], last["emaSlow"],
@@ -1234,15 +960,8 @@ def check():
                 is_forced = force_short_cond and not short_cond
 
             state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time)
-
-            # Mark the Daily Trade Guarantee as satisfied for today, exactly
-            # like the indicator setting tradedToday/forceAttemptedTdy on
-            # ANY entry (organic or forced).
             state["traded_today"] = True
             state["force_attempted_today"] = True
-
-            # Clear the pending signal on entry (matches the indicator
-            # setting pendingLong/pendingShort := false in both entry blocks).
             state["pending_dir"] = None
             state["pending_bar_time"] = None
 
@@ -1274,17 +993,10 @@ def check():
             result["tp3"] = tp3
             result["tp4"] = tp4
         elif force_entry_now:
-            # Force-entry time passed, but direction resolution somehow
-            # produced neither (shouldn't happen since forceDirection always
-            # resolves to +-1) — mark the attempt so we don't retry forever
-            # on subsequent bars today.
             state["force_attempted_today"] = True
 
         save_state(state)
 
-    # Reload state fresh so the "position" snapshot in the Telegram summary
-    # (and the JSON response, for the dashboard) reflects everything that
-    # just happened above.
     state = load_state()
     result["position"] = state.get("position")
 
@@ -1348,8 +1060,6 @@ def stats():
 
 @app.route("/test", methods=["GET"])
 def test_signal():
-    """Sends a forced test message through the real Telegram path using live
-    price data. Does not touch state.json or open a real position."""
     if not TWELVE_DATA_API_KEYS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
@@ -1383,13 +1093,11 @@ def test_signal():
 
 @app.route("/keys", methods=["GET"])
 def keys_status():
-    """Shows how many keys are configured, rotation position, and today's
-    approximate credit usage per key (resets at UTC midnight)."""
     ks = _load_key_state()
     return jsonify({
         "configured_keys": len(TWELVE_DATA_API_KEYS),
         "date_utc": ks["date"],
-        "next_key_index": ks["next_index"] + 1,  # 1-based for readability
+        "next_key_index": ks["next_index"] + 1,
         "usage_today": ks["usage"],
     })
 
@@ -1424,7 +1132,6 @@ def health():
     })
 
 
-# ---------------------- DASHBOARD UI ----------------------
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")

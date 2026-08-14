@@ -1080,16 +1080,28 @@ def check():
     #    the raw exchange feed timezone).
     roll_daily_guarantee_state(state, last["datetime"])
 
-    # 1) Manage an already-open position against this bar's high/low.
-    #    This still runs on weekends and outside trading hours -- if a
-    #    position is open going into either we keep tracking SL/TP against
-    #    whatever the feed reports, we just won't OPEN anything new below.
-    if state["position"] is not None and state.get("last_exit_bar") != bar_time:
-        acted = manage_position(state, last, last["st"])
-        state["last_exit_bar"] = bar_time
-        if acted:
-            result["event"] = "position_update"
-        save_state(state)
+  # 1) Manage the position against EVERY bar since the last time we
+    #    checked, not just the latest one -- catches SL/TP touches that
+    #    happened on bars skipped by an infrequent poll.
+    last_managed_str = state.get("last_managed_bar_time")
+    if last_managed_str:
+        unmanaged_bars = df[df["datetime"] > pd.to_datetime(last_managed_str)]
+        if len(unmanaged_bars) == 0:
+            unmanaged_bars = df.iloc[[-1]]
+    else:
+        unmanaged_bars = df.iloc[[-1]]
+
+    any_managed_event = False
+    for _, bar in unmanaged_bars.iterrows():
+        roll_daily_guarantee_state(state, bar["datetime"])
+        if state["position"] is not None:
+            any_managed_event = manage_position(state, bar, bar["st"]) or any_managed_event
+        state["last_managed_bar_time"] = str(bar["datetime"])
+
+    if any_managed_event:
+        result["event"] = "position_update"
+    state["last_exit_bar"] = bar_time
+    save_state(state)
 
     # 1b) Session guard: don't evaluate/open any NEW signal (organic or
     #     forced) while the current bar is a Saturday/Sunday in

@@ -50,7 +50,7 @@ TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 KEY_STATE_FILE = "api_key_state.json"
 
 # ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
-FAST_LEN = 30
+FAST_LEN = 27
 SLOW_LEN = 32
 USE_RSI = True
 RSI_LEN = 16

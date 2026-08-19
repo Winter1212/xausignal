@@ -55,7 +55,7 @@ SLOW_LEN = 32
 USE_RSI = True
 RSI_LEN = 16
 RSI_OB = 70
-RSI_OS = 30
+RSI_OS = 35
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
 ST_ATR_PERIOD = 8

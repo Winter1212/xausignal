@@ -862,7 +862,14 @@ def run_backtest(days=30):
     chart, but computed from your bot's actual Twelve Data feed and
     actual live logic instead of FXCM chart data.
     """
-    end_date = pd.Timestamp.utcnow()
+    # Twelve Data returns candle timestamps as NAIVE datetimes already
+    # expressed in FORCE_TIMEZONE (we pass timezone=FORCE_TIMEZONE on
+    # every request). end_date/cutoff must therefore also be naive and
+    # in that same timezone -- comparing a naive datetime64 column
+    # against a tz-aware Timestamp (e.g. pd.Timestamp.utcnow()) is what
+    # throws "Invalid comparison between dtype=datetime64[us] and
+    # Timestamp".
+    end_date = pd.Timestamp.now(tz=FORCE_TIMEZONE).tz_localize(None)
     # pad the fetch window so warm-up-hungry indicators (EMA32, ATR12,
     # Supertrend, RSI16) are already stable by the time we reach the
     # actual `days`-ago cutoff -- otherwise the first ~50-100 bars of

@@ -2,30 +2,28 @@ import os
 import json
 import requests
 import pandas as pd
+import fxcmpy
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
 # ---------------------- CONFIG (env vars, set these in Render) ----------------------
-# Multi-key rotation: set up to 3 separate Twelve Data API key
-# (TWELVE_DATA_API_KEY_1/2/3) to spread requests across accounts and get up
-# to 3x the daily credit budget of a single free-tier key. You can also se
-# just TWELVE_DATA_API_KEY_1 alone if you only have one key. Falls back to
-# the legacy single-var TWELVE_DATA_API_KEY if none of the numbered vars
-
-_raw_keys = [
-    os.environ.get("TWELVE_DATA_API_KEY_1", ""),
-    os.environ.get("TWELVE_DATA_API_KEY_2", ""),
-    os.environ.get("TWELVE_DATA_API_KEY_3", ""),
-]
-TWELVE_DATA_API_KEYS = [k for k in _raw_keys if k]
-if not TWELVE_DATA_API_KEYS:
-    legacy = os.environ.get("TWELVE_DATA_API_KEY", "")
-    if legacy:
-        TWELVE_DATA_API_KEYS = [legacy]
+# FXCM demo account access:
+#   1. Open a demo account: https://www.fxcm.com/uk/forex-trading-demo/
+#   2. Log in to Trading Station web: https://tradingstation.fxcm.com/
+#   3. User Account (top right) -> Token Management -> generate a token
+#   4. Set FXCM_ACCESS_TOKEN below to that token. Demo accounts have REST
+#      API access enabled by default (no need to email api@fxcm.com unless
+#      you later move to a live account).
+FXCM_ACCESS_TOKEN = os.environ.get("FXCM_ACCESS_TOKEN", "")
+# "demo" or "real" -- keep "demo" unless/until you deliberately switch to a
+# funded live account.
+FXCM_SERVER = os.environ.get("FXCM_SERVER", "demo")
 
 TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
+# FXCM's instrument naming matches Twelve Data's here -- "XAU/USD" is FXCM's
+# gold symbol too, so this doesn't need to change.
 SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
@@ -46,8 +44,6 @@ TRADING_START_HOUR   = int(os.environ.get("TRADING_START_HOUR", 6))
 TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
 TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 23))
 TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
-
-KEY_STATE_FILE = "api_key_state.json"
 
 # ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
 FAST_LEN = 27
@@ -105,148 +101,100 @@ UNITS_PER_LOT = float(os.environ.get("UNITS_PER_LOT", 100))
 STATE_FILE = "state.json"
 
 
-# ---------------------- API KEY ROTATION ----------------------
-def _load_key_state():
-    today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
-    if os.path.exists(KEY_STATE_FILE):
-        with open(KEY_STATE_FILE) as f:
-            ks = json.load(f)
-    else:
-        ks = {}
-    if ks.get("date") != today:
-        ks = {"date": today, "next_index": 0, "usage": {}}
-    ks.setdefault("next_index", 0)
-    ks.setdefault("usage", {})
-    return ks
+# ---------------------- FXCM DATA FETCHING ----------------------
+# fxcmpy's period codes don't match Twelve Data's interval strings, so we
+# translate. Keep using the same TIMEFRAME / HTF_TIMEFRAME env values you
+# already had ("5min", "4h", etc.) -- only this map needs to know about FXCM.
+_FXCM_PERIOD_MAP = {
+    "1min": "m1", "5min": "m5", "15min": "m15", "30min": "m30",
+    "45min": "m30",  # FXCM has no m45; falls back to m30 if ever used
+    "1h": "H1", "2h": "H2", "3h": "H3", "4h": "H4", "6h": "H6", "8h": "H8",
+    "1day": "D1", "1week": "W1", "1month": "M1",
+}
 
 
-def _save_key_state(ks):
-    with open(KEY_STATE_FILE, "w") as f:
-        json.dump(ks, f, indent=2)
+def _fxcm_period(interval):
+    return _FXCM_PERIOD_MAP.get(interval, interval)
 
 
-def _key_label(i):
-    return f"key_{i + 1}"
-
-
-def fetch_candles(interval, outputsize=5000, credits_per_call=3):
-    if not TWELVE_DATA_API_KEYS:
-        raise RuntimeError("No Twelve Data API key configured. Set TWELVE_DATA_API_KEY_1 (and optionally _2 / _3).")
-
-    ks = _load_key_state()
-    url = "https://api.twelvedata.com/time_series"
-    n = len(TWELVE_DATA_API_KEYS)
-    last_error = None
-
-    for attempt in range(n):
-        idx = (ks["next_index"] + attempt) % n
-        key = TWELVE_DATA_API_KEYS[idx]
-        params = {
-            "symbol": SYMBOL,
-            "interval": interval,
-            "outputsize": outputsize,
-            "apikey": key,
-            "order": "ASC",
-            "timezone": FORCE_TIMEZONE,
-        }
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            data = r.json()
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-        rate_limited = (
-            r.status_code == 429
-            or (isinstance(data, dict) and data.get("code") in (429, 8, 400) and "limit" in str(data.get("message", "")).lower())
+def _fxcm_connect():
+    if not FXCM_ACCESS_TOKEN:
+        raise RuntimeError(
+            "No FXCM_ACCESS_TOKEN configured. Generate one from your FXCM "
+            "demo account: Trading Station web -> User Account -> Token Management."
         )
-
-        if "values" in data:
-            label = _key_label(idx)
-            ks["usage"][label] = ks["usage"].get(label, 0) + credits_per_call
-            ks["next_index"] = (idx + 1) % n
-            _save_key_state(ks)
-
-            df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            for col in ["open", "high", "low", "close"]:
-                df[col] = df[col].astype(float)
-            df = df.sort_values("datetime").reset_index(drop=True)
-            return df
-
-        last_error = data
-        if not rate_limited:
-            break
-
-    raise RuntimeError(f"Twelve Data error for {interval} (tried {min(attempt + 1, n)} key(s)): {last_error}")
+    # log_level='error' keeps fxcmpy's own logging out of your Render logs;
+    # each call opens a fresh socket.io session and closes it when done --
+    # simplest way to use fxcmpy safely from a stateless Flask request.
+    return fxcmpy.FXCMpy(access_token=FXCM_ACCESS_TOKEN, log_level="error", server=FXCM_SERVER)
 
 
-def fetch_candles_range(interval, start_date, end_date, credits_per_call=3):
+def _local_naive_to_utc_naive(dt_local):
+    """Convert a naive datetime expressed in FORCE_TIMEZONE to a naive UTC
+    datetime, since fxcmpy's start/end params are UTC."""
+    ts = pd.Timestamp(dt_local)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(FORCE_TIMEZONE)
+    return ts.tz_convert("UTC").tz_localize(None).to_pydatetime()
+
+
+def _fxcm_candles_to_df(raw):
+    """fxcmpy returns bid/ask OHLC columns indexed by UTC datetime. Convert
+    to the same shape the rest of this file expects: a 'datetime' column
+    (naive, in FORCE_TIMEZONE) plus open/high/low/close (mid prices)."""
+    if raw is None or len(raw) == 0:
+        raise RuntimeError("FXCM returned no candles for this request.")
+
+    df = pd.DataFrame({
+        "datetime": raw.index,
+        "open": (raw["bidopen"] + raw["askopen"]) / 2,
+        "high": (raw["bidhigh"] + raw["askhigh"]) / 2,
+        "low": (raw["bidlow"] + raw["asklow"]) / 2,
+        "close": (raw["bidclose"] + raw["askclose"]) / 2,
+    })
+    df["datetime"] = (
+        pd.to_datetime(df["datetime"])
+        .dt.tz_localize("UTC")
+        .dt.tz_convert(FORCE_TIMEZONE)
+        .dt.tz_localize(None)
+    )
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df
+
+
+def fetch_candles(interval, outputsize=500):
+    con = _fxcm_connect()
+    try:
+        raw = con.get_candles(SYMBOL, period=_fxcm_period(interval), number=outputsize)
+    finally:
+        con.close()
+    return _fxcm_candles_to_df(raw)
+
+
+def fetch_candles_range(interval, start_date, end_date):
     """
-    Same key-rotation logic as fetch_candles(), but pulls an explicit
-    date range instead of a fixed outputsize -- used by the backtester
-    to request a specific historical window (e.g. "last 30 days") rather
-    than "most recent N candles from right now".
+    Same shape/contract as before -- pulls an explicit date range instead of
+    a fixed outputsize, used by the backtester. start_date/end_date are
+    naive datetimes in FORCE_TIMEZONE (as produced by run_backtest()); we
+    convert them to UTC before calling FXCM.
 
-    NOTE: Twelve Data generally caps a single response at 5000 candles
-    regardless of the requested range. For 5-minute XAU/USD bars, 30
-    days of ~24/5 trading can exceed that on some plans. If the returned
-    range is shorter than requested, this function returns what it got
-    rather than fabricating missing candles -- run_backtest() reports
-    the actual covered window in its response so you can see if that
-    happened.
+    NOTE: FXCM (like Twelve Data) can cap how many candles a single request
+    returns depending on period/account tier. If the returned range is
+    shorter than requested, this returns what it got rather than fabricating
+    missing candles -- run_backtest() reports the actual covered window in
+    its response so you can see if that happened.
     """
-    if not TWELVE_DATA_API_KEYS:
-        raise RuntimeError("No Twelve Data API key configured.")
-
-    ks = _load_key_state()
-    url = "https://api.twelvedata.com/time_series"
-    n = len(TWELVE_DATA_API_KEYS)
-    last_error = None
-
-    for attempt in range(n):
-        idx = (ks["next_index"] + attempt) % n
-        key = TWELVE_DATA_API_KEYS[idx]
-        params = {
-            "symbol": SYMBOL,
-            "interval": interval,
-            "start_date": start_date.strftime("%Y-%m-%d %H:%M:%S"),
-            "end_date": end_date.strftime("%Y-%m-%d %H:%M:%S"),
-            "outputsize": 5000,
-            "apikey": key,
-            "order": "ASC",
-            "timezone": FORCE_TIMEZONE,
-        }
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            data = r.json()
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-        rate_limited = (
-            r.status_code == 429
-            or (isinstance(data, dict) and data.get("code") in (429, 8, 400) and "limit" in str(data.get("message", "")).lower())
+    con = _fxcm_connect()
+    try:
+        raw = con.get_candles(
+            SYMBOL,
+            period=_fxcm_period(interval),
+            start=_local_naive_to_utc_naive(start_date),
+            end=_local_naive_to_utc_naive(end_date),
         )
-
-        if "values" in data:
-            label = _key_label(idx)
-            ks["usage"][label] = ks["usage"].get(label, 0) + credits_per_call
-            ks["next_index"] = (idx + 1) % n
-            _save_key_state(ks)
-
-            df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            for col in ["open", "high", "low", "close"]:
-                df[col] = df[col].astype(float)
-            df = df.sort_values("datetime").reset_index(drop=True)
-            return df
-
-        last_error = data
-        if not rate_limited:
-            break
-
-    raise RuntimeError(f"Twelve Data error for {interval} range backtest: {last_error}")
+    finally:
+        con.close()
+    return _fxcm_candles_to_df(raw)
 
 
 # ---------------------- INDICATORS ----------------------
@@ -859,16 +807,11 @@ def run_backtest(days=30):
     `days` days of history, using a fresh in-memory state (never touches
     state.json / your live position), and returns a winrate report --
     the equivalent of what the Pine Script shows on the TradingView
-    chart, but computed from your bot's actual Twelve Data feed and
-    actual live logic instead of FXCM chart data.
+    chart, but computed from your bot's actual FXCM feed and actual live
+    logic instead of FXCM chart data.
     """
-    # Twelve Data returns candle timestamps as NAIVE datetimes already
-    # expressed in FORCE_TIMEZONE (we pass timezone=FORCE_TIMEZONE on
-    # every request). end_date/cutoff must therefore also be naive and
-    # in that same timezone -- comparing a naive datetime64 column
-    # against a tz-aware Timestamp (e.g. pd.Timestamp.utcnow()) is what
-    # throws "Invalid comparison between dtype=datetime64[us] and
-    # Timestamp".
+    # fetch_candles_range() takes naive datetimes in FORCE_TIMEZONE and
+    # converts them to UTC internally before calling FXCM.
     end_date = pd.Timestamp.now(tz=FORCE_TIMEZONE).tz_localize(None)
     # pad the fetch window so warm-up-hungry indicators (EMA32, ATR12,
     # Supertrend, RSI16) are already stable by the time we reach the
@@ -1029,7 +972,7 @@ def run_backtest(days=30):
 # ---------------------- CORE CHECK ----------------------
 @app.route("/check", methods=["GET"])
 def check():
-    if not TWELVE_DATA_API_KEYS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not FXCM_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     df = fetch_candles(TIMEFRAME, outputsize=500)
@@ -1051,15 +994,15 @@ def check():
     # LAG FIX (v2): the previous version of this endpoint (and the first
     # patch of this fix) deduped position-management by bar timestamp --
     # "if we've already processed this bar_time, skip." That's wrong for
-    # the CURRENT bar: Twelve Data returns the still-forming candle with a
-    # live-updating high/low as price moves inside it, so a 5min timeframe
-    # polled every 2min shows the SAME bar timestamp 2-3 times before that
-    # candle finally closes. Deduping by timestamp meant only the FIRST
-    # poll of that candle ever checked its high/low against SL/TP -- every
-    # later poll (where the candle's low had actually dropped further, or
-    # high risen further) was skipped entirely. That's exactly how an SL
-    # can visibly trade through on the live chart while the bot still
-    # shows the position open.
+    # the CURRENT bar: FXCM (like Twelve Data before it) returns the still-
+    # forming candle with a live-updating high/low as price moves inside
+    # it, so a 5min timeframe polled every 2min shows the SAME bar
+    # timestamp 2-3 times before that candle finally closes. Deduping by
+    # timestamp meant only the FIRST poll of that candle ever checked its
+    # high/low against SL/TP -- every later poll (where the candle's low
+    # had actually dropped further, or high risen further) was skipped
+    # entirely. That's exactly how an SL can visibly trade through on the
+    # live chart while the bot still shows the position open.
     #
     # Fix: split management into two passes.
     #   (a) Backfill fully CLOSED bars we haven't processed yet (covers a
@@ -1314,13 +1257,13 @@ def backtest():
     GET /backtest?days=14      -> last 14 days
     GET /backtest?notify=true  -> also posts a summary to Telegram
 
-    Replays the bot's real signal/risk logic over historical Twelve Data
-    candles and reports the winrate, trade count, net P&L, and full
-    trade log -- the equivalent of what the Pine Script shows on the
-    TradingView chart, but from the bot's own data feed and own logic.
+    Replays the bot's real signal/risk logic over historical FXCM candles
+    and reports the winrate, trade count, net P&L, and full trade log --
+    the equivalent of what the Pine Script shows on the TradingView
+    chart, but from the bot's own data feed and own logic.
     """
-    if not TWELVE_DATA_API_KEYS:
-        return jsonify({"error": "Missing Twelve Data API key"}), 500
+    if not FXCM_ACCESS_TOKEN:
+        return jsonify({"error": "Missing FXCM_ACCESS_TOKEN"}), 500
 
     days = int(request.args.get("days", 30))
     try:
@@ -1347,7 +1290,7 @@ def backtest():
 
 @app.route("/test", methods=["GET"])
 def test_signal():
-    if not TWELVE_DATA_API_KEYS or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not FXCM_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     df = fetch_candles(TIMEFRAME, outputsize=100)
@@ -1378,14 +1321,29 @@ def test_signal():
     return jsonify({"status": "test message sent", "message": msg})
 
 
-@app.route("/keys", methods=["GET"])
-def keys_status():
-    ks = _load_key_state()
+@app.route("/fxcm-status", methods=["GET"])
+def fxcm_status():
+    """Replaces the old /keys (Twelve Data credit-rotation) endpoint.
+    FXCM doesn't have a multi-key credit system -- this just confirms the
+    token/server config and does a live connect/disconnect to prove the
+    token actually works."""
+    if not FXCM_ACCESS_TOKEN:
+        return jsonify({"configured": False, "error": "FXCM_ACCESS_TOKEN not set"}), 500
+
+    try:
+        con = _fxcm_connect()
+        connected = con.is_connected()
+        instruments_ok = SYMBOL in con.get_instruments_for_candles()
+        con.close()
+    except Exception as e:
+        return jsonify({"configured": True, "connected": False, "error": str(e)}), 500
+
     return jsonify({
-        "configured_keys": len(TWELVE_DATA_API_KEYS),
-        "date_utc": ks["date"],
-        "next_key_index": ks["next_index"] + 1,
-        "usage_today": ks["usage"],
+        "configured": True,
+        "connected": connected,
+        "server": FXCM_SERVER,
+        "symbol": SYMBOL,
+        "symbol_available": instruments_ok,
     })
 
 
@@ -1393,7 +1351,10 @@ def keys_status():
 def health():
     return jsonify({
         "status": "ok",
-        "keys_configured": len(TWELVE_DATA_API_KEYS),
+        "data_provider": "FXCM",
+        "fxcm_configured": bool(FXCM_ACCESS_TOKEN),
+        "fxcm_server": FXCM_SERVER,
+        "symbol": SYMBOL,
         "use_htf": USE_HTF,
         "htf_timeframe": HTF_TIMEFRAME if USE_HTF else None,
         "st_confirm_bars": ST_CONFIRM_BARS,

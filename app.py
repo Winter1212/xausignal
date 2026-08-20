@@ -181,6 +181,74 @@ def fetch_candles(interval, outputsize=5000, credits_per_call=3):
     raise RuntimeError(f"Twelve Data error for {interval} (tried {min(attempt + 1, n)} key(s)): {last_error}")
 
 
+def fetch_candles_range(interval, start_date, end_date, credits_per_call=3):
+    """
+    Same key-rotation logic as fetch_candles(), but pulls an explicit
+    date range instead of a fixed outputsize -- used by the backtester
+    to request a specific historical window (e.g. "last 30 days") rather
+    than "most recent N candles from right now".
+
+    NOTE: Twelve Data generally caps a single response at 5000 candles
+    regardless of the requested range. For 5-minute XAU/USD bars, 30
+    days of ~24/5 trading can exceed that on some plans. If the returned
+    range is shorter than requested, this function returns what it got
+    rather than fabricating missing candles -- run_backtest() reports
+    the actual covered window in its response so you can see if that
+    happened.
+    """
+    if not TWELVE_DATA_API_KEYS:
+        raise RuntimeError("No Twelve Data API key configured.")
+
+    ks = _load_key_state()
+    url = "https://api.twelvedata.com/time_series"
+    n = len(TWELVE_DATA_API_KEYS)
+    last_error = None
+
+    for attempt in range(n):
+        idx = (ks["next_index"] + attempt) % n
+        key = TWELVE_DATA_API_KEYS[idx]
+        params = {
+            "symbol": SYMBOL,
+            "interval": interval,
+            "start_date": start_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": end_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "outputsize": 5000,
+            "apikey": key,
+            "order": "ASC",
+            "timezone": FORCE_TIMEZONE,
+        }
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            data = r.json()
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        rate_limited = (
+            r.status_code == 429
+            or (isinstance(data, dict) and data.get("code") in (429, 8, 400) and "limit" in str(data.get("message", "")).lower())
+        )
+
+        if "values" in data:
+            label = _key_label(idx)
+            ks["usage"][label] = ks["usage"].get(label, 0) + credits_per_call
+            ks["next_index"] = (idx + 1) % n
+            _save_key_state(ks)
+
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+            df = df.sort_values("datetime").reset_index(drop=True)
+            return df
+
+        last_error = data
+        if not rate_limited:
+            break
+
+    raise RuntimeError(f"Twelve Data error for {interval} range backtest: {last_error}")
+
+
 # ---------------------- INDICATORS ----------------------
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
@@ -478,7 +546,13 @@ def trail_runner_sl(pos, st_value):
 
 
 # ---------------------- POSITION MANAGEMENT ----------------------
-def manage_position(state, last_candle, st_value):
+def manage_position(state, last_candle, st_value, silent=False):
+    """
+    silent=True is used by the backtester (run_backtest()) so replaying
+    history doesn't fire real Telegram alerts. Live /check calls this
+    with no third arg, so silent defaults to False and behavior there is
+    unchanged.
+    """
     pos = state["position"]
     if pos is None:
         return False
@@ -663,21 +737,22 @@ def manage_position(state, last_candle, st_value):
     else:
         sell_side()
 
-    side = "BUY" if pos["dir"] == 1 else "SELL"
-    for label, price, pnl in events:
-        if pnl is None:
-            msg = (
-                f"XAUUSD {side} — {label}\n"
-                f"Price: {price:.2f}\n"
-                f"(Stop loss moved — no P&L booked yet, position still open)"
-            )
-        else:
-            msg = (
-                f"XAUUSD {side} — {label}\n"
-                f"Price: {price:.2f}\n"
-                f"P&L (trade closed): {'+' if pnl >= 0 else ''}${pnl:.2f}"
-            )
-        send_telegram(msg)
+    if not silent:
+        side = "BUY" if pos["dir"] == 1 else "SELL"
+        for label, price, pnl in events:
+            if pnl is None:
+                msg = (
+                    f"XAUUSD {side} — {label}\n"
+                    f"Price: {price:.2f}\n"
+                    f"(Stop loss moved — no P&L booked yet, position still open)"
+                )
+            else:
+                msg = (
+                    f"XAUUSD {side} — {label}\n"
+                    f"Price: {price:.2f}\n"
+                    f"P&L (trade closed): {'+' if pnl >= 0 else ''}${pnl:.2f}"
+                )
+            send_telegram(msg)
 
     return len(events) > 0
 
@@ -775,80 +850,17 @@ def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish
         if not st_bearish or not htf_bearish or timed_out or entries_blocked:
             state["pending_dir"] = None
             state["pending_bar_time"] = None
-def fetch_candles_range(interval, start_date, end_date, credits_per_call=3):
-    """
-    Same key-rotation logic as fetch_candles(), but pulls an explicit
-    date range instead of a fixed outputsize -- needed for backtesting
-    a specific historical window (e.g. 'last 30 days') rather than
-    'most recent N candles from right now'.
- 
-    NOTE: Twelve Data generally caps a single response at 5000 candles
-    regardless of the requested range. For 5-minute XAU/USD bars, 30
-    days of ~24/5 trading can exceed that. If the returned range looks
-    shorter than requested, this function will still return what it got
-    (and run_backtest() below will report the actual covered window) --
-    it will NOT silently pad or fabricate missing candles. If you need
-    a guaranteed full 30 days, this can be extended to page across
-    multiple date-chunked calls.
-    """
-    if not TWELVE_DATA_API_KEYS:
-        raise RuntimeError("No Twelve Data API key configured.")
- 
-    ks = _load_key_state()
-    url = "https://api.twelvedata.com/time_series"
-    n = len(TWELVE_DATA_API_KEYS)
-    last_error = None
- 
-    for attempt in range(n):
-        idx = (ks["next_index"] + attempt) % n
-        key = TWELVE_DATA_API_KEYS[idx]
-        params = {
-            "symbol": SYMBOL,
-            "interval": interval,
-            "start_date": start_date.strftime("%Y-%m-%d %H:%M:%S"),
-            "end_date": end_date.strftime("%Y-%m-%d %H:%M:%S"),
-            "outputsize": 5000,
-            "apikey": key,
-            "order": "ASC",
-            "timezone": FORCE_TIMEZONE,
-        }
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            data = r.json()
-        except Exception as e:
-            last_error = str(e)
-            continue
- 
-        rate_limited = (
-            r.status_code == 429
-            or (isinstance(data, dict) and data.get("code") in (429, 8, 400) and "limit" in str(data.get("message", "")).lower())
-        )
- 
-        if "values" in data:
-            label = _key_label(idx)
-            ks["usage"][label] = ks["usage"].get(label, 0) + credits_per_call
-            ks["next_index"] = (idx + 1) % n
-            _save_key_state(ks)
- 
-            df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            for col in ["open", "high", "low", "close"]:
-                df[col] = df[col].astype(float)
-            df = df.sort_values("datetime").reset_index(drop=True)
-            return df
- 
-        last_error = data
-        if not rate_limited:
-            break
- 
-    raise RuntimeError(f"Twelve Data error for {interval} range backtest: {last_error}")
- 
- 
+
+
+# ---------------------- BACKTEST ----------------------
 def run_backtest(days=30):
     """
     Replays the bot's real entry/exit/session/risk logic over the last
     `days` days of history, using a fresh in-memory state (never touches
-    state.json / your live position), and returns a winrate report.
+    state.json / your live position), and returns a winrate report --
+    the equivalent of what the Pine Script shows on the TradingView
+    chart, but computed from your bot's actual Twelve Data feed and
+    actual live logic instead of FXCM chart data.
     """
     end_date = pd.Timestamp.utcnow()
     # pad the fetch window so warm-up-hungry indicators (EMA32, ATR12,
@@ -856,11 +868,11 @@ def run_backtest(days=30):
     # actual `days`-ago cutoff -- otherwise the first ~50-100 bars of
     # the requested window would have garbage indicator values.
     fetch_start = end_date - pd.Timedelta(days=days + 6)
- 
+
     df = fetch_candles_range(TIMEFRAME, fetch_start, end_date)
     if len(df) < 50:
         return {"error": f"Not enough candles returned ({len(df)}) to backtest. Try a shorter 'days' window."}
- 
+
     df["emaFast"] = ema(df["close"], FAST_LEN)
     df["emaSlow"] = ema(df["close"], SLOW_LEN)
     df["rsi"] = rsi(df["close"], RSI_LEN)
@@ -868,7 +880,7 @@ def run_backtest(days=30):
     st_series, dir_series = supertrend(df, ST_ATR_PERIOD, ST_FACTOR)
     df["st"] = st_series
     df["st_dir"] = dir_series
- 
+
     if USE_HTF:
         htf_df = fetch_candles_range(HTF_TIMEFRAME, fetch_start, end_date)
         _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
@@ -880,12 +892,12 @@ def run_backtest(days=30):
         df["htf_st_dir"] = df["htf_st_dir"].fillna(0).astype(int)
     else:
         df["htf_st_dir"] = 0
- 
+
     cutoff = end_date - pd.Timedelta(days=days)
     cutoff_matches = df.index[df["datetime"] >= cutoff]
     start_idx = int(cutoff_matches[0]) if len(cutoff_matches) else max(0, len(df) - 1)
     start_idx = max(start_idx, 1)  # need a previous bar for cross detection
- 
+
     bt_state = {
         "position": None,
         "history": [],
@@ -898,54 +910,54 @@ def run_backtest(days=30):
         "stats": {"total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
                    "best_trade": None, "worst_trade": None},
     }
- 
+
     for i in range(start_idx, len(df)):
         bar = df.iloc[i]
         prev = df.iloc[i - 1]
         bar_dt = bar["datetime"]
- 
+
         roll_daily_guarantee_state(bt_state, bar_dt)
- 
+
         if bt_state["position"] is not None:
             manage_position(bt_state, bar, bar["st"], silent=True)
- 
+
         weekend_now, outside_hours_now, blocked_now = is_new_entries_blocked(bar_dt)
- 
+
         if blocked_now:
             if bt_state["pending_dir"] is not None:
                 bt_state["pending_dir"] = None
                 bt_state["pending_bar_time"] = None
             continue
- 
+
         if bt_state["position"] is not None:
             continue  # already in a trade this bar, no new entry evaluation
- 
+
         ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and bar["emaFast"] > bar["emaSlow"]
         ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and bar["emaFast"] < bar["emaSlow"]
         rsi_ok_long = (not USE_RSI) or bar["rsi"] < RSI_OB
         rsi_ok_short = (not USE_RSI) or bar["rsi"] > RSI_OS
         st_bullish = bar["st_dir"] == 1
         st_bearish = bar["st_dir"] == -1
- 
+
         bars_since_flip = bars_since_supertrend_flip(dir_series.iloc[:i + 1])
         st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
- 
+
         h_dir = int(bar["htf_st_dir"])
         htf_bullish = (not USE_HTF) or h_dir == 1
         htf_bearish = (not USE_HTF) or h_dir == -1
- 
+
         extension_atr = (abs(bar["close"] - bar["emaFast"]) / bar["atr"]) if bar["atr"] > 0 else 0.0
         extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
         pullback_ok = extension_atr <= PULLBACK_MAX_ATR
- 
+
         base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
         base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
- 
+
         roll_pullback_state(
             bt_state, df.iloc[:i + 1], str(bar_dt), st_bullish, st_bearish, htf_bullish, htf_bearish,
             base_long_cond, base_short_cond, entries_blocked=blocked_now,
         )
- 
+
         if USE_PULLBACK_ENTRY:
             long_cond = (extension_ok and bt_state["pending_dir"] == 1 and pullback_ok
                          and st_bullish and htf_bullish and rsi_ok_long)
@@ -954,17 +966,17 @@ def run_backtest(days=30):
         else:
             long_cond = extension_ok and base_long_cond
             short_cond = extension_ok and base_short_cond
- 
+
         force_entry_now, force_direction = compute_force_entry(
             bt_state, bar_dt, int(bar["st_dir"]), h_dir,
             bar["emaFast"], bar["emaSlow"], bar["rsi"], extension_atr,
         )
         force_long_cond = force_entry_now and force_direction == 1
         force_short_cond = force_entry_now and force_direction == -1
- 
+
         is_long_entry = long_cond or force_long_cond
         is_short_entry = short_cond or force_short_cond
- 
+
         if is_long_entry or is_short_entry:
             entry = bar["close"]
             sl_dist = min(max(bar["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
@@ -978,7 +990,7 @@ def run_backtest(days=30):
                 risk = sl - entry
                 tp1, tp2, tp3, tp4 = entry - risk * RR1, entry - risk * RR2, entry - risk * RR3, entry - risk * RR4
                 side = "SELL"
- 
+
             bt_state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, str(bar_dt))
             bt_state["traded_today"] = True
             bt_state["force_attempted_today"] = True
@@ -986,10 +998,10 @@ def run_backtest(days=30):
             bt_state["pending_bar_time"] = None
         elif force_entry_now:
             bt_state["force_attempted_today"] = True
- 
+
     s = bt_state["stats"]
     win_rate = (s["wins"] / s["total_trades"] * 100) if s["total_trades"] else 0
- 
+
     return {
         "requested_days": days,
         "data_covers_from": str(df.iloc[start_idx]["datetime"]),
@@ -1005,34 +1017,6 @@ def run_backtest(days=30):
         "trade_log": bt_state["history"],
         "position_still_open_at_end": bt_state["position"],
     }
- 
- 
-@app.route("/backtest", methods=["GET"])
-def backtest():
-    if not TWELVE_DATA_API_KEYS:
-        return jsonify({"error": "Missing Twelve Data API key"}), 500
- 
-    days = int(request.args.get("days", 30))
-    try:
-        result = run_backtest(days=days)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
- 
-    if "error" in result:
-        return jsonify(result), 400
- 
-    if _notify_requested():
-        msg = (
-            f"📊 [Backtest] XAUUSD — last {result['requested_days']}d\n"
-            f"Window: {result['data_covers_from']} -> {result['data_covers_to']}\n"
-            f"Win rate: {result['win_rate']}% "
-            f"({result['wins']}W / {result['losses']}L / {result['total_trades']} total)\n"
-            f"Net P&L: {'+' if result['net_pnl'] >= 0 else ''}${result['net_pnl']:.2f}"
-        )
-        send_telegram(msg)
-        result["telegram_notified"] = True
- 
-    return jsonify(result)
 
 
 # ---------------------- CORE CHECK ----------------------
@@ -1314,6 +1298,44 @@ def stats():
         payload["telegram_notified"] = True
 
     return jsonify(payload)
+
+
+@app.route("/backtest", methods=["GET"])
+def backtest():
+    """
+    GET /backtest              -> last 30 days (default)
+    GET /backtest?days=14      -> last 14 days
+    GET /backtest?notify=true  -> also posts a summary to Telegram
+
+    Replays the bot's real signal/risk logic over historical Twelve Data
+    candles and reports the winrate, trade count, net P&L, and full
+    trade log -- the equivalent of what the Pine Script shows on the
+    TradingView chart, but from the bot's own data feed and own logic.
+    """
+    if not TWELVE_DATA_API_KEYS:
+        return jsonify({"error": "Missing Twelve Data API key"}), 500
+
+    days = int(request.args.get("days", 30))
+    try:
+        result = run_backtest(days=days)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if "error" in result:
+        return jsonify(result), 400
+
+    if _notify_requested():
+        msg = (
+            f"📊 [Backtest] XAUUSD — last {result['requested_days']}d\n"
+            f"Window: {result['data_covers_from']} -> {result['data_covers_to']}\n"
+            f"Win rate: {result['win_rate']}% "
+            f"({result['wins']}W / {result['losses']}L / {result['total_trades']} total)\n"
+            f"Net P&L: {'+' if result['net_pnl'] >= 0 else ''}${result['net_pnl']:.2f}"
+        )
+        send_telegram(msg)
+        result["telegram_notified"] = True
+
+    return jsonify(result)
 
 
 @app.route("/test", methods=["GET"])

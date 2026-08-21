@@ -2,29 +2,34 @@ import os
 import json
 import requests
 import pandas as pd
-import fxcmpy
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
 # ---------------------- CONFIG (env vars, set these in Render) ----------------------
-# FXCM demo account access:
-#   1. Open a demo account: https://www.fxcm.com/uk/forex-trading-demo/
-#   2. Log in to Trading Station web: https://tradingstation.fxcm.com/
-#   3. User Account (top right) -> Token Management -> generate a token
-#   4. Set FXCM_ACCESS_TOKEN below to that token. Demo accounts have REST
-#      API access enabled by default (no need to email api@fxcm.com unless
-#      you later move to a live account).
-FXCM_ACCESS_TOKEN = os.environ.get("FXCM_ACCESS_TOKEN", "")
-# "demo" or "real" -- keep "demo" unless/until you deliberately switch to a
-# funded live account.
-FXCM_SERVER = os.environ.get("FXCM_SERVER", "demo")
+# Capital.com demo account access:
+#   1. Open a demo account: https://capital.com/
+#   2. Log in, enable Two-Factor Authentication (required before you can
+#      generate an API key).
+#   3. Settings -> API integrations -> Generate API key. Give it a Custom
+#      password (recommended, separate from your login password).
+#   4. Set the three env vars below from that step: CAPITAL_API_KEY (the
+#      generated key), CAPITAL_IDENTIFIER (your login/email), and
+#      CAPITAL_PASSWORD (the custom API password you set, or your account
+#      password if you didn't set a custom one).
+CAPITAL_API_KEY    = os.environ.get("CAPITAL_API_KEY", "")
+CAPITAL_IDENTIFIER = os.environ.get("CAPITAL_IDENTIFIER", "")
+CAPITAL_PASSWORD   = os.environ.get("CAPITAL_PASSWORD", "")
+# Demo base URL by default -- switch to "https://api-capital.backend-capital.com"
+# only when/if you deliberately move to a funded live account.
+CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://demo-api-capital.backend-capital.com")
 
 TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
-# FXCM's instrument naming matches Twelve Data's here -- "XAU/USD" is FXCM's
-# gold symbol too, so this doesn't need to change.
-SYMBOL               = os.environ.get("SYMBOL", "XAU/USD")
+# Capital.com identifies instruments by "epic" rather than a "XAU/USD"-style
+# ticker. Gold's epic is "GOLD" (verify with GET /api/v1/markets?searchTerm=gold
+# using your session tokens if this ever needs confirming for your account type).
+SYMBOL               = os.environ.get("SYMBOL", "GOLD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
 
@@ -101,57 +106,83 @@ UNITS_PER_LOT = float(os.environ.get("UNITS_PER_LOT", 100))
 STATE_FILE = "state.json"
 
 
-# ---------------------- FXCM DATA FETCHING ----------------------
-# fxcmpy's period codes don't match Twelve Data's interval strings, so we
-# translate. Keep using the same TIMEFRAME / HTF_TIMEFRAME env values you
-# already had ("5min", "4h", etc.) -- only this map needs to know about FXCM.
-_FXCM_PERIOD_MAP = {
-    "1min": "m1", "5min": "m5", "15min": "m15", "30min": "m30",
-    "45min": "m30",  # FXCM has no m45; falls back to m30 if ever used
-    "1h": "H1", "2h": "H2", "3h": "H3", "4h": "H4", "6h": "H6", "8h": "H8",
-    "1day": "D1", "1week": "W1", "1month": "M1",
+# ---------------------- CAPITAL.COM DATA FETCHING ----------------------
+# Capital.com's resolution codes don't match Twelve Data's interval strings,
+# so we translate. Keep using the same TIMEFRAME / HTF_TIMEFRAME env values
+# you already had ("5min", "4h", etc.) -- only this map needs to know about
+# Capital.com's naming.
+_CAPITAL_RESOLUTION_MAP = {
+    "1min": "MINUTE", "5min": "MINUTE_5", "15min": "MINUTE_15", "30min": "MINUTE_30",
+    "45min": "MINUTE_30",  # no 45-minute resolution; falls back if ever used
+    "1h": "HOUR", "4h": "HOUR_4",
+    "1day": "DAY", "1week": "WEEK",
 }
 
 
-def _fxcm_period(interval):
-    return _FXCM_PERIOD_MAP.get(interval, interval)
+def _capital_resolution(interval):
+    return _CAPITAL_RESOLUTION_MAP.get(interval, interval)
 
 
-def _fxcm_connect():
-    if not FXCM_ACCESS_TOKEN:
+def _capital_session_headers():
+    """
+    Capital.com auth is session-based rather than a single static token:
+    you exchange your API key + login + password for two short-lived
+    tokens (CST and X-SECURITY-TOKEN) via POST /session, then send both on
+    every subsequent request. Sessions expire after ~10 minutes of
+    inactivity, so -- same pattern as the old FXCM connection helper --
+    we just open a fresh session on every call rather than trying to
+    cache/reuse one across stateless Flask requests.
+    """
+    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
         raise RuntimeError(
-            "No FXCM_ACCESS_TOKEN configured. Generate one from your FXCM "
-            "demo account: Trading Station web -> User Account -> Token Management."
+            "Missing Capital.com credentials. Set CAPITAL_API_KEY, "
+            "CAPITAL_IDENTIFIER (your login/email), and CAPITAL_PASSWORD "
+            "(the custom API password you set when generating the key)."
         )
-    # log_level='error' keeps fxcmpy's own logging out of your Render logs;
-    # each call opens a fresh socket.io session and closes it when done --
-    # simplest way to use fxcmpy safely from a stateless Flask request.
-    return fxcmpy.FXCMpy(access_token=FXCM_ACCESS_TOKEN, log_level="error", server=FXCM_SERVER)
+    url = f"{CAPITAL_BASE_URL}/api/v1/session"
+    headers = {"X-CAP-API-KEY": CAPITAL_API_KEY, "Content-Type": "application/json"}
+    body = {"identifier": CAPITAL_IDENTIFIER, "password": CAPITAL_PASSWORD, "encryptedPassword": False}
+    r = requests.post(url, headers=headers, json=body, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"Capital.com session error ({r.status_code}): {r.text}")
+
+    cst = r.headers.get("CST")
+    security_token = r.headers.get("X-SECURITY-TOKEN")
+    if not cst or not security_token:
+        raise RuntimeError("Capital.com session response was missing CST/X-SECURITY-TOKEN headers.")
+    return {"CST": cst, "X-SECURITY-TOKEN": security_token}
 
 
 def _local_naive_to_utc_naive(dt_local):
     """Convert a naive datetime expressed in FORCE_TIMEZONE to a naive UTC
-    datetime, since fxcmpy's start/end params are UTC."""
+    datetime, since Capital.com's from/to params are UTC."""
     ts = pd.Timestamp(dt_local)
     if ts.tzinfo is None:
         ts = ts.tz_localize(FORCE_TIMEZONE)
     return ts.tz_convert("UTC").tz_localize(None).to_pydatetime()
 
 
-def _fxcm_candles_to_df(raw):
-    """fxcmpy returns bid/ask OHLC columns indexed by UTC datetime. Convert
-    to the same shape the rest of this file expects: a 'datetime' column
-    (naive, in FORCE_TIMEZONE) plus open/high/low/close (mid prices)."""
-    if raw is None or len(raw) == 0:
-        raise RuntimeError("FXCM returned no candles for this request.")
+def _capital_prices_to_df(payload):
+    """Capital.com returns a 'prices' list of bid/ask OHLC candles with a
+    snapshotTimeUTC field. Convert to the same shape the rest of this file
+    expects: a 'datetime' column (naive, in FORCE_TIMEZONE) plus
+    open/high/low/close (mid prices)."""
+    prices = payload.get("prices", [])
+    if not prices:
+        raise RuntimeError("Capital.com returned no candles for this request.")
 
-    df = pd.DataFrame({
-        "datetime": raw.index,
-        "open": (raw["bidopen"] + raw["askopen"]) / 2,
-        "high": (raw["bidhigh"] + raw["askhigh"]) / 2,
-        "low": (raw["bidlow"] + raw["asklow"]) / 2,
-        "close": (raw["bidclose"] + raw["askclose"]) / 2,
-    })
+    rows = []
+    for p in prices:
+        o, c, h, l = p["openPrice"], p["closePrice"], p["highPrice"], p["lowPrice"]
+        rows.append({
+            "datetime": p["snapshotTimeUTC"],
+            "open": (o["bid"] + o["ask"]) / 2,
+            "high": (h["bid"] + h["ask"]) / 2,
+            "low": (l["bid"] + l["ask"]) / 2,
+            "close": (c["bid"] + c["ask"]) / 2,
+        })
+
+    df = pd.DataFrame(rows)
     df["datetime"] = (
         pd.to_datetime(df["datetime"])
         .dt.tz_localize("UTC")
@@ -163,12 +194,12 @@ def _fxcm_candles_to_df(raw):
 
 
 def fetch_candles(interval, outputsize=500):
-    con = _fxcm_connect()
-    try:
-        raw = con.get_candles(SYMBOL, period=_fxcm_period(interval), number=outputsize)
-    finally:
-        con.close()
-    return _fxcm_candles_to_df(raw)
+    headers = _capital_session_headers()
+    params = {"resolution": _capital_resolution(interval), "max": min(outputsize, 1000)}
+    r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"Capital.com prices error ({r.status_code}): {r.text}")
+    return _capital_prices_to_df(r.json())
 
 
 def fetch_candles_range(interval, start_date, end_date):
@@ -176,25 +207,26 @@ def fetch_candles_range(interval, start_date, end_date):
     Same shape/contract as before -- pulls an explicit date range instead of
     a fixed outputsize, used by the backtester. start_date/end_date are
     naive datetimes in FORCE_TIMEZONE (as produced by run_backtest()); we
-    convert them to UTC before calling FXCM.
+    convert them to UTC before calling Capital.com.
 
-    NOTE: FXCM (like Twelve Data) can cap how many candles a single request
-    returns depending on period/account tier. If the returned range is
-    shorter than requested, this returns what it got rather than fabricating
-    missing candles -- run_backtest() reports the actual covered window in
-    its response so you can see if that happened.
+    NOTE: Capital.com caps a single response at max=1000 candles. If the
+    returned range is shorter than requested, this returns what it got
+    rather than fabricating missing candles -- run_backtest() reports the
+    actual covered window in its response so you can see if that happened.
     """
-    con = _fxcm_connect()
-    try:
-        raw = con.get_candles(
-            SYMBOL,
-            period=_fxcm_period(interval),
-            start=_local_naive_to_utc_naive(start_date),
-            end=_local_naive_to_utc_naive(end_date),
-        )
-    finally:
-        con.close()
-    return _fxcm_candles_to_df(raw)
+    headers = _capital_session_headers()
+    start_utc = _local_naive_to_utc_naive(start_date)
+    end_utc = _local_naive_to_utc_naive(end_date)
+    params = {
+        "resolution": _capital_resolution(interval),
+        "max": 1000,
+        "from": start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+        "to": end_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Capital.com prices range error ({r.status_code}): {r.text}")
+    return _capital_prices_to_df(r.json())
 
 
 # ---------------------- INDICATORS ----------------------
@@ -807,11 +839,11 @@ def run_backtest(days=30):
     `days` days of history, using a fresh in-memory state (never touches
     state.json / your live position), and returns a winrate report --
     the equivalent of what the Pine Script shows on the TradingView
-    chart, but computed from your bot's actual FXCM feed and actual live
-    logic instead of FXCM chart data.
+    chart, but computed from your bot's actual Capital.com feed and actual
+    live logic instead of FXCM/Twelve Data chart data.
     """
     # fetch_candles_range() takes naive datetimes in FORCE_TIMEZONE and
-    # converts them to UTC internally before calling FXCM.
+    # converts them to UTC internally before calling Capital.com.
     end_date = pd.Timestamp.now(tz=FORCE_TIMEZONE).tz_localize(None)
     # pad the fetch window so warm-up-hungry indicators (EMA32, ATR12,
     # Supertrend, RSI16) are already stable by the time we reach the
@@ -972,7 +1004,7 @@ def run_backtest(days=30):
 # ---------------------- CORE CHECK ----------------------
 @app.route("/check", methods=["GET"])
 def check():
-    if not FXCM_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD) or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     df = fetch_candles(TIMEFRAME, outputsize=500)
@@ -994,7 +1026,7 @@ def check():
     # LAG FIX (v2): the previous version of this endpoint (and the first
     # patch of this fix) deduped position-management by bar timestamp --
     # "if we've already processed this bar_time, skip." That's wrong for
-    # the CURRENT bar: FXCM (like Twelve Data before it) returns the still-
+    # the CURRENT bar: Capital.com (like the providers before it) returns the still-
     # forming candle with a live-updating high/low as price moves inside
     # it, so a 5min timeframe polled every 2min shows the SAME bar
     # timestamp 2-3 times before that candle finally closes. Deduping by
@@ -1257,13 +1289,13 @@ def backtest():
     GET /backtest?days=14      -> last 14 days
     GET /backtest?notify=true  -> also posts a summary to Telegram
 
-    Replays the bot's real signal/risk logic over historical FXCM candles
+    Replays the bot's real signal/risk logic over historical Capital.com candles
     and reports the winrate, trade count, net P&L, and full trade log --
     the equivalent of what the Pine Script shows on the TradingView
     chart, but from the bot's own data feed and own logic.
     """
-    if not FXCM_ACCESS_TOKEN:
-        return jsonify({"error": "Missing FXCM_ACCESS_TOKEN"}), 500
+    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
+        return jsonify({"error": "Missing Capital.com credentials (CAPITAL_API_KEY / CAPITAL_IDENTIFIER / CAPITAL_PASSWORD)"}), 500
 
     days = int(request.args.get("days", 30))
     try:
@@ -1290,7 +1322,7 @@ def backtest():
 
 @app.route("/test", methods=["GET"])
 def test_signal():
-    if not FXCM_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD) or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
     df = fetch_candles(TIMEFRAME, outputsize=100)
@@ -1321,29 +1353,30 @@ def test_signal():
     return jsonify({"status": "test message sent", "message": msg})
 
 
-@app.route("/fxcm-status", methods=["GET"])
-def fxcm_status():
-    """Replaces the old /keys (Twelve Data credit-rotation) endpoint.
-    FXCM doesn't have a multi-key credit system -- this just confirms the
-    token/server config and does a live connect/disconnect to prove the
-    token actually works."""
-    if not FXCM_ACCESS_TOKEN:
-        return jsonify({"configured": False, "error": "FXCM_ACCESS_TOKEN not set"}), 500
+@app.route("/capital-status", methods=["GET"])
+def capital_status():
+    """Replaces the old /keys (Twelve Data) and /fxcm-status endpoints.
+    Confirms the API key/login/password actually authenticate and that a
+    real candle can be pulled for SYMBOL (your configured epic)."""
+    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
+        return jsonify({"configured": False, "error": "CAPITAL_API_KEY / CAPITAL_IDENTIFIER / CAPITAL_PASSWORD not fully set"}), 500
 
     try:
-        con = _fxcm_connect()
-        connected = con.is_connected()
-        instruments_ok = SYMBOL in con.get_instruments_for_candles()
-        con.close()
+        headers = _capital_session_headers()
+        r = requests.get(
+            f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}",
+            headers=headers, params={"resolution": "MINUTE", "max": 1}, timeout=15,
+        )
+        symbol_available = r.status_code == 200 and bool(r.json().get("prices"))
     except Exception as e:
         return jsonify({"configured": True, "connected": False, "error": str(e)}), 500
 
     return jsonify({
         "configured": True,
-        "connected": connected,
-        "server": FXCM_SERVER,
+        "connected": True,
+        "base_url": CAPITAL_BASE_URL,
         "symbol": SYMBOL,
-        "symbol_available": instruments_ok,
+        "symbol_available": symbol_available,
     })
 
 
@@ -1351,9 +1384,9 @@ def fxcm_status():
 def health():
     return jsonify({
         "status": "ok",
-        "data_provider": "FXCM",
-        "fxcm_configured": bool(FXCM_ACCESS_TOKEN),
-        "fxcm_server": FXCM_SERVER,
+        "data_provider": "Capital.com",
+        "capital_configured": bool(CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD),
+        "capital_base_url": CAPITAL_BASE_URL,
         "symbol": SYMBOL,
         "use_htf": USE_HTF,
         "htf_timeframe": HTF_TIMEFRAME if USE_HTF else None,

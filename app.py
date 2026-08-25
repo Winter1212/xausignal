@@ -50,13 +50,38 @@ TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
 TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 23))
 TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 
+# ---------------------- DAY-OF-WEEK FILTER ----------------------
+# Mirrors the indicator's "Day-of-Week Filter" group: when enabled, no
+# trade of any kind (organic, pullback, or Forced Daily) is allowed to
+# open unless today (in FORCE_TIMEZONE) is one of the checked days.
+# Defaults match the indicator: Wed/Thu/Fri only.
+USE_DAY_FILTER = os.environ.get("USE_DAY_FILTER", "true").lower() == "true"
+TRADE_MON = os.environ.get("TRADE_MON", "false").lower() == "true"
+TRADE_TUE = os.environ.get("TRADE_TUE", "true").lower() == "true"
+TRADE_WED = os.environ.get("TRADE_WED", "true").lower() == "true"
+TRADE_THU = os.environ.get("TRADE_THU", "true").lower() == "true"
+TRADE_FRI = os.environ.get("TRADE_FRI", "true").lower() == "true"
+TRADE_SAT = os.environ.get("TRADE_SAT", "false").lower() == "true"
+TRADE_SUN = os.environ.get("TRADE_SUN", "false").lower() == "true"
+
+# datetime.weekday(): Monday=0 ... Sunday=6
+_DAY_FLAGS_BY_WEEKDAY = {
+    0: TRADE_MON, 1: TRADE_TUE, 2: TRADE_WED, 3: TRADE_THU,
+    4: TRADE_FRI, 5: TRADE_SAT, 6: TRADE_SUN,
+}
+_DAY_LABEL_FLAGS = [
+    ("Monday", TRADE_MON), ("Tuesday", TRADE_TUE), ("Wednesday", TRADE_WED),
+    ("Thursday", TRADE_THU), ("Friday", TRADE_FRI), ("Saturday", TRADE_SAT),
+    ("Sunday", TRADE_SUN),
+]
+
 # ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
 FAST_LEN = 27
 SLOW_LEN = 32
 USE_RSI = True
-RSI_LEN = 16
+RSI_LEN = 15
 RSI_OB = 70
-RSI_OS = 35
+RSI_OS = 30
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
 ST_ATR_PERIOD = 8
@@ -71,15 +96,15 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 
 # ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION ----------------------
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
-PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.4))
-PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 8))
+PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.2))
+PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 4))
 
 USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
-MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.5))
+MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
 
 # ---------------------- DAILY TRADE GUARANTEE ----------------------
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
-FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 11))
+FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))
 
 FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "true"
@@ -94,7 +119,7 @@ ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 1.9, 2.5, 2.5, 3.5
+RR1, RR2, RR3, RR4 = 1.9, 3.0, 4.0, 4.0
 
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
@@ -331,10 +356,17 @@ def is_outside_trading_hours(bar_dt):
     return not (start_min <= minutes_now <= end_min)
 
 
+def is_day_blocked(bar_dt):
+    if not USE_DAY_FILTER:
+        return False
+    return not _DAY_FLAGS_BY_WEEKDAY.get(bar_dt.weekday(), False)
+
+
 def is_new_entries_blocked(bar_dt):
     weekend = DISABLE_WEEKEND_SIGNALS and is_weekend_bar(bar_dt)
     outside_hours = is_outside_trading_hours(bar_dt)
-    return weekend, outside_hours, (weekend or outside_hours)
+    day_blocked = is_day_blocked(bar_dt)
+    return weekend, outside_hours, day_blocked, (weekend or outside_hours or day_blocked)
 
 
 # ---------------------- STATE ----------------------
@@ -407,6 +439,8 @@ def build_check_telegram_message(result, state):
         lines.append("Result: weekend — new-signal checks skipped (existing position, if any, still managed).")
     elif result.get("trading_hours_skipped"):
         lines.append("Result: outside trading hours — new-signal checks skipped (existing position, if any, still managed).")
+    elif result.get("day_skipped"):
+        lines.append("Result: today isn't a selected trading day — new-signal checks skipped (existing position, if any, still managed).")
     else:
         pending = state.get("pending_dir")
         if pending:
@@ -460,6 +494,11 @@ def build_stats_telegram_message(payload, state):
             f"Trading hours: {th['start_hour']:02d}:{th['start_minute']:02d}"
             f"-{th['end_hour']:02d}:{th['end_minute']:02d} {th['timezone']}"
         )
+
+    dayf = payload.get("day_filter", {})
+    if dayf.get("enabled"):
+        selected = ", ".join(dayf.get("selected_days", [])) or "none"
+        lines.append(f"Day filter: {selected}")
 
     return "\n".join(lines)
 
@@ -762,7 +801,7 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
     if not GUARANTEE_DAILY_TRADE:
         return False, 0
 
-    _, _, blocked = is_new_entries_blocked(bar_dt)
+    *_, blocked = is_new_entries_blocked(bar_dt)
     if blocked:
         return False, 0
 
@@ -903,7 +942,7 @@ def run_backtest(days=30):
         if bt_state["position"] is not None:
             manage_position(bt_state, bar, bar["st"], silent=True)
 
-        weekend_now, outside_hours_now, blocked_now = is_new_entries_blocked(bar_dt)
+        weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(bar_dt)
 
         if blocked_now:
             if bt_state["pending_dir"] is not None:
@@ -1077,10 +1116,11 @@ def check():
     # 1b) Session guard: don't evaluate/open any NEW signal (organic or
     #     forced) while the current bar is a Saturday/Sunday in
     #     FORCE_TIMEZONE, OR while it's outside the configured trading-hours
-    #     window. Still update last_signal_bar so we don't just spin
-    #     re-checking the same closed bar. Also explicitly clears any
-    #     pending pullback signal that was armed before the block started.
-    weekend_now, outside_hours_now, blocked_now = is_new_entries_blocked(last["datetime"])
+    #     window, OR while today isn't a selected trading day. Still update
+    #     last_signal_bar so we don't just spin re-checking the same closed
+    #     bar. Also explicitly clears any pending pullback signal that was
+    #     armed before the block started.
+    weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(last["datetime"])
     if blocked_now:
         state["last_signal_bar"] = bar_time
         if state.get("pending_dir") is not None:
@@ -1088,10 +1128,12 @@ def check():
             state["pending_bar_time"] = None
         result["weekend_skipped"] = weekend_now
         result["trading_hours_skipped"] = outside_hours_now
+        result["day_skipped"] = day_blocked_now
         save_state(state)
 
     # 2) Only look for a NEW entry if we're currently flat, it's not a bar
-    #    we've already processed, and it's not weekend/outside trading hours.
+    #    we've already processed, and it's not weekend/outside trading hours/
+    #    an unselected day.
     if (not blocked_now) and state["position"] is None and state.get("last_signal_bar") != bar_time:
         prev = df.iloc[-2]
 
@@ -1236,6 +1278,7 @@ def stats():
     state = load_state()
     s = state["stats"]
     win_rate = (s["wins"] / s["total_trades"] * 100) if s["total_trades"] else 0
+    selected_days = [name for name, flag in _DAY_LABEL_FLAGS if flag]
     payload = {
         "position": state["position"],
         "win_rate": round(win_rate, 1),
@@ -1271,6 +1314,11 @@ def stats():
             "start_minute": TRADING_START_MINUTE,
             "end_hour": TRADING_END_HOUR,
             "end_minute": TRADING_END_MINUTE,
+            "timezone": FORCE_TIMEZONE,
+        },
+        "day_filter": {
+            "enabled": USE_DAY_FILTER,
+            "selected_days": selected_days,
             "timezone": FORCE_TIMEZONE,
         },
     }
@@ -1409,6 +1457,8 @@ def health():
         "use_trading_hours": USE_TRADING_HOURS,
         "trading_start": f"{TRADING_START_HOUR:02d}:{TRADING_START_MINUTE:02d}" if USE_TRADING_HOURS else None,
         "trading_end": f"{TRADING_END_HOUR:02d}:{TRADING_END_MINUTE:02d}" if USE_TRADING_HOURS else None,
+        "use_day_filter": USE_DAY_FILTER,
+        "selected_days": [name for name, flag in _DAY_LABEL_FLAGS if flag] if USE_DAY_FILTER else None,
         "dashboard": "/dashboard",
     })
 
@@ -1692,11 +1742,12 @@ function renderError(msg){
   document.getElementById('results').innerHTML = `<div class="error-box">⚠ ${esc(msg)}</div>`;
 }
 
-function eventBadge(event, weekendSkipped, hoursSkipped){
+function eventBadge(event, weekendSkipped, hoursSkipped, daySkipped){
   if(event === 'entry') return `<span class="badge neutral">New Entry</span>`;
   if(event === 'position_update') return `<span class="badge muted">Position Updated</span>`;
   if(weekendSkipped) return `<span class="badge muted">Weekend — Skipped</span>`;
   if(hoursSkipped) return `<span class="badge muted">Outside Trading Hours</span>`;
+  if(daySkipped) return `<span class="badge muted">Day Not Selected</span>`;
   return `<span class="badge muted">No Signal</span>`;
 }
 
@@ -1743,12 +1794,14 @@ function renderCheck(data){
     sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">🌙 Weekend — new-signal checks are paused. Any open position is still tracked.</p>`;
   }else if(data.trading_hours_skipped){
     sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">🌙 Outside trading hours — new-signal checks are paused. Any open position is still tracked.</p>`;
+  }else if(data.day_skipped){
+    sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">📅 Today isn't a selected trading day — new-signal checks are paused. Any open position is still tracked.</p>`;
   }
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
       <div class="panel-head">
-        <div class="title">Check Result ${eventBadge(data.event, data.weekend_skipped, data.trading_hours_skipped)} ${notifiedBadge}</div>
+        <div class="title">Check Result ${eventBadge(data.event, data.weekend_skipped, data.trading_hours_skipped, data.day_skipped)} ${notifiedBadge}</div>
         <div class="timestamp">${esc(data.bar_time || '—')}</div>
       </div>
       <div class="panel-body">
@@ -1782,6 +1835,7 @@ function renderStats(data){
   const dg = data.daily_guarantee || {};
   const ps = data.pending_signal || {};
   const th = data.trading_hours || {};
+  const df = data.day_filter || {};
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
@@ -1809,6 +1863,9 @@ function renderStats(data){
 
         <div class="section-label">Trading Hours</div>
         <div class="kv"><span class="k">Window</span><span class="v">${th.enabled ? `${String(th.start_hour).padStart(2,'0')}:${String(th.start_minute).padStart(2,'0')}-${String(th.end_hour).padStart(2,'0')}:${String(th.end_minute).padStart(2,'0')}` : 'Off (24h)'}</span></div>
+
+        <div class="section-label">Day Filter</div>
+        <div class="kv"><span class="k">Selected days</span><span class="v">${df.enabled ? (df.selected_days && df.selected_days.length ? df.selected_days.join(', ') : 'None selected') : 'Off (all days)'}</span></div>
 
         <div class="section-label">Recent Trades</div>
         <div class="scroll-x">

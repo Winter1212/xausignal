@@ -47,7 +47,7 @@ DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lowe
 USE_TRADING_HOURS   = os.environ.get("USE_TRADING_HOURS", "true").lower() == "true"
 TRADING_START_HOUR   = int(os.environ.get("TRADING_START_HOUR", 6))
 TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
-TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 23))
+TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 22))
 TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 
 # ---------------------- DAY-OF-WEEK FILTER ----------------------
@@ -79,9 +79,9 @@ _DAY_LABEL_FLAGS = [
 FAST_LEN = 27
 SLOW_LEN = 32
 USE_RSI = True
-RSI_LEN = 15
+RSI_LEN = 16
 RSI_OB = 70
-RSI_OS = 30
+RSI_OS = 35
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
 ST_ATR_PERIOD = 8
@@ -96,15 +96,15 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 
 # ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION ----------------------
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
-PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.2))
-PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 4))
+PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.4))
+PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 8))
 
 USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
-MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
+MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.5))
 
 # ---------------------- DAILY TRADE GUARANTEE ----------------------
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
-FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))
+FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 11))
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))
 
 FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "true"
@@ -119,7 +119,7 @@ ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 1.9, 3.0, 4.0, 4.0
+RR1, RR2, RR3, RR4 = 2, 3.0, 3.0, 3.5
 
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 

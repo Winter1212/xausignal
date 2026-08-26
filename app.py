@@ -57,7 +57,7 @@ TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 # Defaults match the indicator: Wed/Thu/Fri only.
 USE_DAY_FILTER = os.environ.get("USE_DAY_FILTER", "true").lower() == "true"
 TRADE_MON = os.environ.get("TRADE_MON", "false").lower() == "true"
-TRADE_TUE = os.environ.get("TRADE_TUE", "true").lower() == "true"
+TRADE_TUE = os.environ.get("TRADE_TUE", "false").lower() == "true"
 TRADE_WED = os.environ.get("TRADE_WED", "true").lower() == "true"
 TRADE_THU = os.environ.get("TRADE_THU", "true").lower() == "true"
 TRADE_FRI = os.environ.get("TRADE_FRI", "true").lower() == "true"

@@ -47,7 +47,7 @@ DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lowe
 USE_TRADING_HOURS   = os.environ.get("USE_TRADING_HOURS", "true").lower() == "true"
 TRADING_START_HOUR   = int(os.environ.get("TRADING_START_HOUR", 6))
 TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
-TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 22))
+TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 23))
 TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 
 # ---------------------- DAY-OF-WEEK FILTER ----------------------
@@ -119,7 +119,7 @@ ATR_LEN = 12
 SL_MULT = 1
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 2, 3.0, 3.0, 3.5
+RR1, RR2, RR3, RR4 = 2, 3.5, 3.5, 4.5
 
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 

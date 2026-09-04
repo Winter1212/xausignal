@@ -6,7 +6,7 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
-# ---------------------- CONFIG (env vars, set these in Render) ----------------------
+# ---------------------- CONFG (env vars, set these in Render) ----------------------
 # Capital.com dem account access:
 #   1. Open a demo account: https://capital.com/
 #   2. Log in, enable Two-Factor Authentication (required before you can

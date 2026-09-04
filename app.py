@@ -76,12 +76,12 @@ _DAY_LABEL_FLAGS = [
 ]
 
 # ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
-FAST_LEN = 27
+FAST_LEN = 30
 SLOW_LEN = 32
 USE_RSI = True
-RSI_LEN = 16
+RSI_LEN = 15
 RSI_OB = 70
-RSI_OS = 35
+RSI_OS = 40
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
 ST_ATR_PERIOD = 8
@@ -125,7 +125,7 @@ PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
 USE_TRAILING_RUNNER = True
 
-LOT_SIZE = float(os.environ.get("LOT_SIZE", 0.01))
+LOT_SIZE = float(os.environ.get("LOT_SIZE", 0.05))
 UNITS_PER_LOT = float(os.environ.get("UNITS_PER_LOT", 100))
 
 STATE_FILE = "state.json"

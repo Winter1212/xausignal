@@ -121,6 +121,13 @@ SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
 RR1, RR2, RR3, RR4 = 2, 3.5, 3.5, 4.5
 
+# When TP1 is hit, the SL no longer jumps to pure breakeven. It moves to
+# entry +/- LOCK_PTS (in the trade's favor) instead, so a reversal after
+# TP1 still books LOCK_PTS of profit rather than scratching at $0.
+# Mirrors the Pine indicator's "Lock Profit At TP1 (price points)" input
+# (default 10). Set to 0.0 to restore the old pure-breakeven behavior.
+LOCK_PTS = float(os.environ.get("LOCK_PTS", 10.0))
+
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
 USE_TRAILING_RUNNER = True
@@ -538,9 +545,12 @@ def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
 
 # ---------------------- RATCHET HELPERS ----------------------
 def ratchet_to_breakeven(pos):
+    # Was: pos["sl"] = pos["entry"]  (pure breakeven, locks $0)
+    # Now: SL moves to entry +/- LOCK_PTS in the trade's favor, so a
+    # reversal after TP1 still books LOCK_PTS of profit instead of $0.
     pos["tp1_hit"] = True
     pos["remaining_size"] = 0.75
-    pos["sl"] = pos["entry"]
+    pos["sl"] = pos["entry"] + LOCK_PTS if pos["dir"] == 1 else pos["entry"] - LOCK_PTS
 
 
 def ratchet_to_tp1(pos):
@@ -613,23 +623,23 @@ def manage_position(state, last_candle, st_value, silent=False):
                     events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
                 elif high >= pos["tp3"]:
                     ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
                     ratchet_to_tp1(pos)
                     events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
                     ratchet_to_tp2(pos)
                     events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
                 elif high >= pos["tp2"]:
                     ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
                     ratchet_to_tp1(pos)
                     events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
                 elif high >= pos["tp1"]:
                     ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
             elif pos["tp1_hit"] and not pos["tp2_hit"]:
                 if low <= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven, $0)")
-                    events.append(("SL Hit (After TP1 — Breakeven, $0)", pos["sl"], pnl))
+                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Profit Locked)")
+                    events.append(("SL Hit (After TP1 — Profit Locked)", pos["sl"], pnl))
                 elif high >= pos["tp4"]:
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
                     events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
@@ -699,23 +709,23 @@ def manage_position(state, last_candle, st_value, silent=False):
                     events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
                 elif low <= pos["tp3"]:
                     ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
                     ratchet_to_tp1(pos)
                     events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
                     ratchet_to_tp2(pos)
                     events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
                 elif low <= pos["tp2"]:
                     ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
                     ratchet_to_tp1(pos)
                     events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
                 elif low <= pos["tp1"]:
                     ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Entry)", pos["tp1"], None))
+                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
             elif pos["tp1_hit"] and not pos["tp2_hit"]:
                 if high >= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Breakeven, $0)")
-                    events.append(("SL Hit (After TP1 — Breakeven, $0)", pos["sl"], pnl))
+                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Profit Locked)")
+                    events.append(("SL Hit (After TP1 — Profit Locked)", pos["sl"], pnl))
                 elif low <= pos["tp4"]:
                     pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
                     events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
@@ -1445,6 +1455,7 @@ def health():
         "use_extension_filter": USE_EXTENSION_FILTER,
         "max_extension_atr": MAX_EXTENSION_ATR,
         "pnl_mode": PNL_MODE,
+        "lock_pts_at_tp1": LOCK_PTS,
         "guarantee_daily_trade": GUARANTEE_DAILY_TRADE,
         "force_hour": FORCE_HOUR,
         "force_minute": FORCE_MINUTE,

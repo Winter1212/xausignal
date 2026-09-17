@@ -150,6 +150,14 @@ _CAPITAL_RESOLUTION_MAP = {
     "1day": "DAY", "1week": "WEEK",
 }
 
+# Duration of one candle per interval, in minutes. Used to figure out how
+# far a single <=1000-candle Capital.com request can reach, so multi-chunk
+# pagination (see fetch_candles_range) knows how wide to make each chunk.
+_INTERVAL_MINUTES = {
+    "1min": 1, "5min": 5, "15min": 15, "30min": 30, "45min": 30,
+    "1h": 60, "4h": 240, "1day": 1440, "1week": 10080,
+}
+
 
 def _capital_resolution(interval):
     return _CAPITAL_RESOLUTION_MAP.get(interval, interval)
@@ -234,31 +242,70 @@ def fetch_candles(interval, outputsize=500):
     return _capital_prices_to_df(r.json())
 
 
-def fetch_candles_range(interval, start_date, end_date):
+def fetch_candles_range(interval, start_date, end_date, session_headers=None):
     """
     Same shape/contract as before -- pulls an explicit date range instead of
     a fixed outputsize, used by the backtester. start_date/end_date are
     naive datetimes in FORCE_TIMEZONE (as produced by run_backtest()); we
     convert them to UTC before calling Capital.com.
 
-    NOTE: Capital.com caps a single response at max=1000 candles. If the
-    returned range is shorter than requested, this returns what it got
-    rather than fabricating missing candles -- run_backtest() reports the
-    actual covered window in its response so you can see if that happened.
+    PAGINATION: Capital.com caps a single response at max=1000 candles.
+    Rather than silently returning a truncated window when the requested
+    range needs more than that (this happens fast on 5-minute bars --
+    1000 candles is only ~3.5 days), this walks the range forward in
+    <=1000-candle chunks and concatenates them, so callers can ask for
+    weeks or months of history and actually get it.
+
+    Pass session_headers to reuse one already-open Capital.com session
+    across every chunk (and, e.g., across a paired entry-timeframe +
+    higher-timeframe fetch) instead of logging in fresh per chunk --
+    important once a fetch needs more than one or two chunks. If omitted,
+    a session is opened here and used for the whole call.
     """
-    headers = _capital_session_headers()
+    own_session = session_headers is None
+    headers = session_headers or _capital_session_headers()
+
+    resolution = _capital_resolution(interval)
+    interval_minutes = _INTERVAL_MINUTES.get(interval, 5)
+    chunk_span = pd.Timedelta(minutes=interval_minutes * 1000)
+
     start_utc = _local_naive_to_utc_naive(start_date)
     end_utc = _local_naive_to_utc_naive(end_date)
-    params = {
-        "resolution": _capital_resolution(interval),
-        "max": 1000,
-        "from": start_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-        "to": end_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"Capital.com prices range error ({r.status_code}): {r.text}")
-    return _capital_prices_to_df(r.json())
+
+    frames = []
+    cur_start = start_utc
+    while cur_start < end_utc:
+        cur_end = min(cur_start + chunk_span, end_utc)
+        params = {
+            "resolution": resolution,
+            "max": 1000,
+            "from": cur_start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "to": cur_end.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
+        if r.status_code in (401, 403) and own_session:
+            # session most likely expired mid-pagination (a wide range can
+            # take longer than the ~10min session lifetime) -- log in
+            # again once and retry this one chunk before giving up.
+            headers = _capital_session_headers()
+            r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Capital.com prices range error ({r.status_code}): {r.text}")
+        payload = r.json()
+        if payload.get("prices"):
+            frames.append(_capital_prices_to_df(payload))
+        cur_start = cur_end
+
+    if not frames:
+        raise RuntimeError("Capital.com returned no candles for this request.")
+
+    df = (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(subset="datetime")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    return df
 
 
 # ---------------------- INDICATORS ----------------------
@@ -1050,6 +1097,221 @@ def run_backtest(days=30):
     }
 
 
+# ---------------------- SIGNAL-COUNT BACKTEST (last N signals) ----------------------
+def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
+    """
+    Like run_backtest(), but instead of a fixed lookback window in days,
+    this keeps pulling further back in time -- via fetch_candles_range()'s
+    pagination, so it isn't stuck at Capital.com's 1000-candle-per-request
+    cap -- until it has replayed at least `target_count` of the bot's own
+    trade signals (organic, pullback, or Forced Daily), then reports the
+    most recent `target_count` of them.
+
+    "Signal" means a trade the bot actually opened. Each one is tracked
+    from the moment it opens, so if the very latest signal hasn't closed
+    yet it's still included, marked status "open" with no exit/pnl yet,
+    rather than being silently dropped.
+
+    One Capital.com session is opened up front and reused across every
+    paginated chunk and every HTF fetch in this call, since re-logging-in
+    per chunk would be slow and can hit rate limits once history spans
+    weeks or months.
+    """
+    headers = _capital_session_headers()
+    days = initial_days
+    df = None
+    start_idx = 0
+    all_signals = []
+
+    while True:
+        end_date = pd.Timestamp.now(tz=FORCE_TIMEZONE).tz_localize(None)
+        fetch_start = end_date - pd.Timedelta(days=days + 6)
+
+        df = fetch_candles_range(TIMEFRAME, fetch_start, end_date, session_headers=headers)
+        if len(df) < 50:
+            if days >= max_days:
+                return {"error": f"Not enough candles returned ({len(df)}) even at the {max_days}-day cap."}
+            days = min(days * 2, max_days)
+            continue
+
+        df["emaFast"] = ema(df["close"], FAST_LEN)
+        df["emaSlow"] = ema(df["close"], SLOW_LEN)
+        df["rsi"] = rsi(df["close"], RSI_LEN)
+        df["atr"] = atr(df, ATR_LEN)
+        st_series, dir_series = supertrend(df, ST_ATR_PERIOD, ST_FACTOR)
+        df["st"] = st_series
+        df["st_dir"] = dir_series
+
+        if USE_HTF:
+            htf_df = fetch_candles_range(HTF_TIMEFRAME, fetch_start, end_date, session_headers=headers)
+            _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
+            htf_df = htf_df[["datetime"]].copy()
+            htf_df["htf_st_dir"] = htf_dir_series.values
+            df = pd.merge_asof(df.sort_values("datetime"), htf_df.sort_values("datetime"),
+                                on="datetime", direction="backward")
+            df["htf_st_dir"] = df["htf_st_dir"].fillna(0).astype(int)
+        else:
+            df["htf_st_dir"] = 0
+
+        cutoff = end_date - pd.Timedelta(days=days)
+        cutoff_matches = df.index[df["datetime"] >= cutoff]
+        start_idx = int(cutoff_matches[0]) if len(cutoff_matches) else max(0, len(df) - 1)
+        start_idx = max(start_idx, 1)
+
+        bt_state = {
+            "position": None, "history": [],
+            "pending_dir": None, "pending_bar_time": None,
+            "current_day": None, "traded_today": False,
+            "force_attempted_today": False, "force_skipped_today": False,
+            "stats": {"total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
+                      "best_trade": None, "worst_trade": None},
+        }
+        all_signals = []
+        open_signal_idx = None
+
+        for i in range(start_idx, len(df)):
+            bar = df.iloc[i]
+            prev = df.iloc[i - 1]
+            bar_dt = bar["datetime"]
+
+            roll_daily_guarantee_state(bt_state, bar_dt)
+
+            if bt_state["position"] is not None:
+                manage_position(bt_state, bar, bar["st"], silent=True)
+                if bt_state["position"] is None and open_signal_idx is not None:
+                    closed = bt_state["history"][0]
+                    all_signals[open_signal_idx].update({
+                        "status": "closed",
+                        "exit": closed["exit"],
+                        "result": closed["result"],
+                        "points": closed["points"],
+                        "pnl": closed["pnl"],
+                    })
+                    open_signal_idx = None
+
+            weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(bar_dt)
+
+            if blocked_now:
+                if bt_state["pending_dir"] is not None:
+                    bt_state["pending_dir"] = None
+                    bt_state["pending_bar_time"] = None
+                continue
+
+            if bt_state["position"] is not None:
+                continue
+
+            ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and bar["emaFast"] > bar["emaSlow"]
+            ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and bar["emaFast"] < bar["emaSlow"]
+            rsi_ok_long = (not USE_RSI) or bar["rsi"] < RSI_OB
+            rsi_ok_short = (not USE_RSI) or bar["rsi"] > RSI_OS
+            st_bullish = bar["st_dir"] == 1
+            st_bearish = bar["st_dir"] == -1
+
+            bars_since_flip = bars_since_supertrend_flip(dir_series.iloc[:i + 1])
+            st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
+
+            h_dir = int(bar["htf_st_dir"])
+            htf_bullish = (not USE_HTF) or h_dir == 1
+            htf_bearish = (not USE_HTF) or h_dir == -1
+
+            extension_atr = (abs(bar["close"] - bar["emaFast"]) / bar["atr"]) if bar["atr"] > 0 else 0.0
+            extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
+            pullback_ok = extension_atr <= PULLBACK_MAX_ATR
+
+            base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
+            base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
+
+            roll_pullback_state(
+                bt_state, df.iloc[:i + 1], str(bar_dt), st_bullish, st_bearish, htf_bullish, htf_bearish,
+                base_long_cond, base_short_cond, entries_blocked=blocked_now,
+            )
+
+            if USE_PULLBACK_ENTRY:
+                long_cond = (extension_ok and bt_state["pending_dir"] == 1 and pullback_ok
+                             and st_bullish and htf_bullish and rsi_ok_long)
+                short_cond = (extension_ok and bt_state["pending_dir"] == -1 and pullback_ok
+                              and st_bearish and htf_bearish and rsi_ok_short)
+            else:
+                long_cond = extension_ok and base_long_cond
+                short_cond = extension_ok and base_short_cond
+
+            force_entry_now, force_direction = compute_force_entry(
+                bt_state, bar_dt, int(bar["st_dir"]), h_dir,
+                bar["emaFast"], bar["emaSlow"], bar["rsi"], extension_atr,
+            )
+            force_long_cond = force_entry_now and force_direction == 1
+            force_short_cond = force_entry_now and force_direction == -1
+
+            is_long_entry = long_cond or force_long_cond
+            is_short_entry = short_cond or force_short_cond
+
+            if is_long_entry or is_short_entry:
+                entry = bar["close"]
+                sl_dist = min(max(bar["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
+                if is_long_entry:
+                    sl = entry - sl_dist
+                    risk = entry - sl
+                    tp1, tp2, tp3, tp4 = entry + risk * RR1, entry + risk * RR2, entry + risk * RR3, entry + risk * RR4
+                    side = "BUY"
+                    is_forced = force_long_cond and not long_cond
+                else:
+                    sl = entry + sl_dist
+                    risk = sl - entry
+                    tp1, tp2, tp3, tp4 = entry - risk * RR1, entry - risk * RR2, entry - risk * RR3, entry - risk * RR4
+                    side = "SELL"
+                    is_forced = force_short_cond and not short_cond
+
+                bt_state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, str(bar_dt))
+                bt_state["traded_today"] = True
+                bt_state["force_attempted_today"] = True
+                bt_state["pending_dir"] = None
+                bt_state["pending_bar_time"] = None
+
+                is_pullback = USE_PULLBACK_ENTRY and not is_forced
+                all_signals.append({
+                    "entry_time": str(bar_dt), "side": side,
+                    "entry": round(entry, 2), "sl": round(sl, 2),
+                    "tp1": round(tp1, 2), "tp2": round(tp2, 2), "tp3": round(tp3, 2), "tp4": round(tp4, 2),
+                    "forced": is_forced, "pullback": is_pullback,
+                    "status": "open", "exit": None, "result": None, "points": None, "pnl": None,
+                })
+                open_signal_idx = len(all_signals) - 1
+            elif force_entry_now:
+                bt_state["force_attempted_today"] = True
+
+        if len(all_signals) >= target_count or days >= max_days:
+            break
+        days = min(days * 2, max_days)
+
+    last_signals = all_signals[-target_count:] if len(all_signals) > target_count else all_signals
+    closed = [s for s in last_signals if s["status"] == "closed"]
+    wins = sum(1 for s in closed if s["pnl"] is not None and s["pnl"] >= 0)
+    losses = len(closed) - wins
+    net_pnl = sum(s["pnl"] for s in closed) if closed else 0.0
+    win_rate = round((wins / len(closed) * 100), 1) if closed else 0
+    pnl_values = [s["pnl"] for s in closed]
+    best_trade = max(pnl_values) if pnl_values else None
+    worst_trade = min(pnl_values) if pnl_values else None
+
+    return {
+        "requested_signal_count": target_count,
+        "signals_found_in_window": len(all_signals),
+        "signals_returned": len(last_signals),
+        "days_scanned": days,
+        "data_covers_from": str(df.iloc[start_idx]["datetime"]),
+        "data_covers_to": str(df.iloc[-1]["datetime"]),
+        "closed_trades": len(closed),
+        "still_open": len(last_signals) - len(closed),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_pnl": round(net_pnl, 2),
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "signals": last_signals,
+    }
+
+
 # ---------------------- CORE CHECK ----------------------
 @app.route("/check", methods=["GET"])
 def check():
@@ -1378,6 +1640,47 @@ def backtest():
     return jsonify(result)
 
 
+@app.route("/signals", methods=["GET"])
+def signals_history():
+    """
+    GET /signals                -> last 120 signals (default)
+    GET /signals?count=50       -> last 50 signals
+    GET /signals?notify=true    -> also posts a summary to Telegram
+
+    Walks back through Capital.com history -- paginating past the
+    1000-candle-per-request cap as needed, which is what let TradingView's
+    5000-bar chart limit hold you back before -- until it has replayed at
+    least `count` of the bot's own trade signals (organic, pullback, or
+    Forced Daily), then reports win rate, net P&L, and the full list of
+    those signals (including one still open, if the most recent signal
+    hasn't closed yet).
+    """
+    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
+        return jsonify({"error": "Missing Capital.com credentials (CAPITAL_API_KEY / CAPITAL_IDENTIFIER / CAPITAL_PASSWORD)"}), 500
+
+    count = int(request.args.get("count", 120))
+    try:
+        result = run_signal_backtest(target_count=count)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if "error" in result:
+        return jsonify(result), 400
+
+    if _notify_requested():
+        msg = (
+            f"📊 [Last {result['signals_returned']} Signals] XAUUSD\n"
+            f"Scanned back {result['days_scanned']}d "
+            f"({result['closed_trades']} closed, {result['still_open']} still open)\n"
+            f"Win rate: {result['win_rate']}% ({result['wins']}W / {result['losses']}L)\n"
+            f"Net P&L: {'+' if result['net_pnl'] >= 0 else ''}${result['net_pnl']:.2f}"
+        )
+        send_telegram(msg)
+        result["telegram_notified"] = True
+
+    return jsonify(result)
+
+
 @app.route("/test", methods=["GET"])
 def test_signal():
     if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD) or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1471,6 +1774,7 @@ def health():
         "use_day_filter": USE_DAY_FILTER,
         "selected_days": [name for name, flag in _DAY_LABEL_FLAGS if flag] if USE_DAY_FILTER else None,
         "dashboard": "/dashboard",
+        "signals_endpoint": "/signals?count=120",
     })
 
 
@@ -1582,6 +1886,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .spinner{width:13px;height:13px;border-radius:50%;border:2px solid rgba(20,16,8,.35);border-top-color:#141008;animation:spin .7s linear infinite;display:none;}
   button.run.loading .spinner{display:inline-block;}
   @keyframes spin{to{transform:rotate(360deg);}}
+  .field-row{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .field-row label{font-size:12.5px;color:var(--text-dim);}
+  .field-row input[type="number"]{
+    width:70px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);
+    font-family:var(--mono);font-size:13px;border-radius:7px;padding:6px 8px;text-align:right;
+  }
 
   /* ---- Results panel ---- */
   .results{margin-top:20px;}
@@ -1679,10 +1989,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span class="spinner"></span><span class="label">Get Stats</span>
       </button>
     </div>
+
+    <div class="card">
+      <h2>Last N Signals</h2>
+      <p class="desc">Walks back through history (past the 1000-candle-per-request cap, as far as needed) and replays the bot's own logic until it has this many trade signals, then reports the result.</p>
+      <div class="field-row">
+        <label for="signalCount">How many signals</label>
+        <input type="number" id="signalCount" value="120" min="1" max="1000" step="1">
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Send result to Telegram</span>
+        <label class="switch"><input type="checkbox" id="notifySignals"><span class="slider"></span></label>
+      </div>
+      <button class="run secondary" id="btnSignals" onclick="runSignals()">
+        <span class="spinner"></span><span class="label">Get Last N Signals</span>
+      </button>
+    </div>
   </div>
 
   <div class="results" id="results">
-    <div class="empty">Run a check or pull stats to see live output here.</div>
+    <div class="empty">Run a check, pull stats, or fetch signal history to see live output here.</div>
   </div>
 
   <footer>state persists server-side · times shown in bot's FORCE_TIMEZONE</footer>
@@ -1742,6 +2068,23 @@ async function runStats(){
     const data = await res.json();
     if(!res.ok){ renderError(data.error || 'Request failed'); return; }
     renderStats(data);
+  }catch(e){
+    renderError('Could not reach the server: ' + e.message);
+  }finally{
+    setLoading(btn, false);
+  }
+}
+
+async function runSignals(){
+  const btn = document.getElementById('btnSignals');
+  const notify = document.getElementById('notifySignals').checked;
+  const count = document.getElementById('signalCount').value || 120;
+  setLoading(btn, true);
+  try{
+    const res = await fetch(`/signals?count=${encodeURIComponent(count)}&notify=${notify ? 1 : 0}`);
+    const data = await res.json();
+    if(!res.ok){ renderError(data.error || 'Request failed'); return; }
+    renderSignals(data);
   }catch(e){
     renderError('Could not reach the server: ' + e.message);
   }finally{
@@ -1882,6 +2225,55 @@ function renderStats(data){
         <div class="scroll-x">
           <table>
             <thead><tr><th>Side</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&amp;L</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderSignals(data){
+  const notifiedBadge = data.telegram_notified ? `<span class="badge neutral">Sent to Telegram</span>` : '';
+  const pnlClass = data.net_pnl > 0 ? 'pos' : (data.net_pnl < 0 ? 'neg' : '');
+  const rows = (data.signals || []).map(s => {
+    const sideClass = s.side === 'BUY' ? 'buy' : 'sell';
+    const pnlC = s.pnl > 0 ? 'pos' : (s.pnl < 0 ? 'neg' : '');
+    const tag = s.forced ? ' ⚡' : (s.pullback ? ' ↩' : '');
+    const statusLabel = s.status === 'open' ? '<span class="badge neutral">Open</span>' : esc(s.result || '—');
+    return `
+      <tr>
+        <td>${esc(s.entry_time)}</td>
+        <td class="side-tag ${sideClass}">${esc(s.side)}${tag}</td>
+        <td>${fmtPrice(s.entry)}</td>
+        <td>${s.exit !== null ? fmtPrice(s.exit) : '—'}</td>
+        <td>${statusLabel}</td>
+        <td class="${pnlC}">${s.pnl !== null ? fmtMoney(s.pnl) : '—'}</td>
+      </tr>
+    `;
+  }).join('') || `<tr><td colspan="6" style="color:var(--text-faint);text-align:center;">No signals found in the scanned window</td></tr>`;
+
+  document.getElementById('results').innerHTML = `
+    <div class="panel">
+      <div class="panel-head">
+        <div class="title">Last ${data.signals_returned} Signals ${notifiedBadge}</div>
+        <div class="timestamp">${esc(data.data_covers_from || '')} → ${esc(data.data_covers_to || '')}</div>
+      </div>
+      <div class="panel-body">
+        <div class="grid4">
+          <div class="stat-box"><div class="k">Win Rate</div><div class="v gold">${data.win_rate}%</div></div>
+          <div class="stat-box"><div class="k">Record</div><div class="v">${data.wins}W – ${data.losses}L</div></div>
+          <div class="stat-box"><div class="k">Net P&amp;L</div><div class="v ${pnlClass}">${fmtMoney(data.net_pnl)}</div></div>
+          <div class="stat-box"><div class="k">Days Scanned</div><div class="v">${data.days_scanned}</div></div>
+        </div>
+        <p style="font-size:11.5px;color:var(--text-faint);margin-top:10px;">
+          ${data.closed_trades} closed${data.still_open ? `, ${data.still_open} still open` : ''} ·
+          best ${fmtMoney(data.best_trade)} · worst ${fmtMoney(data.worst_trade)}
+        </p>
+        <div class="section-label">Signal Log</div>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Bar Time</th><th>Side</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&amp;L</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>

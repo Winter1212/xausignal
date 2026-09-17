@@ -244,57 +244,71 @@ def fetch_candles(interval, outputsize=500):
 
 def fetch_candles_range(interval, start_date, end_date, session_headers=None):
     """
-    Same shape/contract as before -- pulls an explicit date range instead of
-    a fixed outputsize, used by the backtester. start_date/end_date are
-    naive datetimes in FORCE_TIMEZONE (as produced by run_backtest()); we
-    convert them to UTC before calling Capital.com.
-
-    PAGINATION: Capital.com caps a single response at max=1000 candles.
-    Rather than silently returning a truncated window when the requested
-    range needs more than that (this happens fast on 5-minute bars --
-    1000 candles is only ~3.5 days), this walks the range forward in
-    <=1000-candle chunks and concatenates them, so callers can ask for
-    weeks or months of history and actually get it.
-
-    Pass session_headers to reuse one already-open Capital.com session
-    across every chunk (and, e.g., across a paired entry-timeframe +
-    higher-timeframe fetch) instead of logging in fresh per chunk --
-    important once a fetch needs more than one or two chunks. If omitted,
-    a session is opened here and used for the whole call.
+    Same shape/contract as before. PAGINATION: Capital.com caps a single
+    response at max=1000 candles AND enforces its own (undocumented,
+    resolution-dependent) cap on how wide a single from/to window can be --
+    independent of how many candles that window implies. Rather than
+    hardcoding a "safe" chunk size per resolution (which breaks the moment
+    Capital.com's real limit differs from our guess -- this is exactly what
+    was happening on HOUR_4/DAY HTF fetches), we start from the
+    candle-count-based chunk_span as an upper bound, and if a chunk still
+    gets rejected with error.invalid.max.daterange, we halve that chunk's
+    width and retry, continuing to halve until Capital.com accepts it.
     """
     own_session = session_headers is None
     headers = session_headers or _capital_session_headers()
 
     resolution = _capital_resolution(interval)
     interval_minutes = _INTERVAL_MINUTES.get(interval, 5)
-    chunk_span = pd.Timedelta(minutes=interval_minutes * 1000)
+    max_chunk_span = pd.Timedelta(minutes=interval_minutes * 1000)
 
     start_utc = _local_naive_to_utc_naive(start_date)
     end_utc = _local_naive_to_utc_naive(end_date)
 
     frames = []
     cur_start = start_utc
+    chunk_span = max_chunk_span
+
     while cur_start < end_utc:
         cur_end = min(cur_start + chunk_span, end_utc)
-        params = {
-            "resolution": resolution,
-            "max": 1000,
-            "from": cur_start.strftime("%Y-%m-%dT%H:%M:%S"),
-            "to": cur_end.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
-        if r.status_code in (401, 403) and own_session:
-            # session most likely expired mid-pagination (a wide range can
-            # take longer than the ~10min session lifetime) -- log in
-            # again once and retry this one chunk before giving up.
-            headers = _capital_session_headers()
+
+        while True:
+            params = {
+                "resolution": resolution,
+                "max": 1000,
+                "from": cur_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                "to": cur_end.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
             r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
-        if r.status_code != 200:
-            raise RuntimeError(f"Capital.com prices range error ({r.status_code}): {r.text}")
+
+            if r.status_code in (401, 403) and own_session:
+                headers = _capital_session_headers()
+                r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
+
+            if r.status_code == 400 and "error.invalid.max.daterange" in r.text:
+                # This window is still too wide for this resolution --
+                # halve it and try again. Give up if it's shrunk to
+                # something absurdly small (a bug elsewhere, not a range issue).
+                new_span = (cur_end - cur_start) / 2
+                if new_span < pd.Timedelta(minutes=interval_minutes):
+                    raise RuntimeError(
+                        f"Capital.com prices range error ({r.status_code}): {r.text} "
+                        f"(even after shrinking the window down to {new_span})"
+                    )
+                cur_end = cur_start + new_span
+                chunk_span = new_span  # remember the working size for subsequent chunks too
+                continue
+
+            if r.status_code != 200:
+                raise RuntimeError(f"Capital.com prices range error ({r.status_code}): {r.text}")
+
+            break  # success
+
         payload = r.json()
         if payload.get("prices"):
             frames.append(_capital_prices_to_df(payload))
         cur_start = cur_end
+        chunk_span = min(chunk_span, max_chunk_span)  # never grow back past the 1000-candle bound
 
     if not frames:
         raise RuntimeError("Capital.com returned no candles for this request.")

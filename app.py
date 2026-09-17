@@ -244,16 +244,31 @@ def fetch_candles(interval, outputsize=500):
 
 def fetch_candles_range(interval, start_date, end_date, session_headers=None):
     """
-    Same shape/contract as before. PAGINATION: Capital.com caps a single
-    response at max=1000 candles AND enforces its own (undocumented,
-    resolution-dependent) cap on how wide a single from/to window can be --
-    independent of how many candles that window implies. Rather than
-    hardcoding a "safe" chunk size per resolution (which breaks the moment
-    Capital.com's real limit differs from our guess -- this is exactly what
-    was happening on HOUR_4/DAY HTF fetches), we start from the
-    candle-count-based chunk_span as an upper bound, and if a chunk still
-    gets rejected with error.invalid.max.daterange, we halve that chunk's
-    width and retry, continuing to halve until Capital.com accepts it.
+    Same shape/contract as before -- pulls an explicit date range instead of
+    a fixed outputsize, used by the backtester. start_date/end_date are
+    naive datetimes in FORCE_TIMEZONE (as produced by run_backtest()); we
+    convert them to UTC before calling Capital.com.
+
+    PAGINATION: Capital.com caps a single response at max=1000 candles, but
+    it ALSO enforces its own (undocumented, resolution-dependent) cap on how
+    wide a single from/to window can be -- independent of how many candles
+    that window implies. A HOUR_4 or DAY window sized purely off the
+    1000-candle math (e.g. ~167 days for HOUR_4) can still be rejected with
+    "error.invalid.max.daterange" even though it's well under the 1000-candle
+    limit. Rather than hardcoding a "safe" chunk width per resolution (which
+    breaks the moment Capital.com's real limit differs from our guess), we
+    start from the candle-count-based chunk width as an upper bound and, if a
+    chunk is rejected specifically with error.invalid.max.daterange, halve
+    that chunk's width and retry -- continuing to halve until Capital.com
+    accepts it. The working width is then reused (but never grown back past
+    the 1000-candle ceiling) for subsequent chunks, so we don't rediscover
+    the limit from scratch every time.
+
+    Pass session_headers to reuse one already-open Capital.com session
+    across every chunk (and, e.g., across a paired entry-timeframe +
+    higher-timeframe fetch) instead of logging in fresh per chunk --
+    important once a fetch needs more than one or two chunks. If omitted,
+    a session is opened here and used for the whole call.
     """
     own_session = session_headers is None
     headers = session_headers or _capital_session_headers()
@@ -282,18 +297,23 @@ def fetch_candles_range(interval, start_date, end_date, session_headers=None):
             r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
 
             if r.status_code in (401, 403) and own_session:
+                # session most likely expired mid-pagination (a wide range can
+                # take longer than the ~10min session lifetime) -- log in
+                # again once and retry this one chunk before giving up.
                 headers = _capital_session_headers()
                 r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
 
             if r.status_code == 400 and "error.invalid.max.daterange" in r.text:
-                # This window is still too wide for this resolution --
-                # halve it and try again. Give up if it's shrunk to
-                # something absurdly small (a bug elsewhere, not a range issue).
+                # This window is too wide for this resolution's (undocumented)
+                # per-request date-range cap -- halve it and try the same
+                # chunk again. Bail out only if it's been shrunk down to
+                # something absurd (a single candle's worth), which would
+                # indicate a different, unrelated problem.
                 new_span = (cur_end - cur_start) / 2
                 if new_span < pd.Timedelta(minutes=interval_minutes):
                     raise RuntimeError(
                         f"Capital.com prices range error ({r.status_code}): {r.text} "
-                        f"(even after shrinking the window down to {new_span})"
+                        f"(still rejected after shrinking the window down to {new_span})"
                     )
                 cur_end = cur_start + new_span
                 chunk_span = new_span  # remember the working size for subsequent chunks too
@@ -302,13 +322,15 @@ def fetch_candles_range(interval, start_date, end_date, session_headers=None):
             if r.status_code != 200:
                 raise RuntimeError(f"Capital.com prices range error ({r.status_code}): {r.text}")
 
-            break  # success
+            break  # this chunk succeeded
 
         payload = r.json()
         if payload.get("prices"):
             frames.append(_capital_prices_to_df(payload))
         cur_start = cur_end
-        chunk_span = min(chunk_span, max_chunk_span)  # never grow back past the 1000-candle bound
+        # never let a previously-shrunk chunk_span grow back past the
+        # 1000-candle ceiling for later chunks
+        chunk_span = min(chunk_span, max_chunk_span)
 
     if not frames:
         raise RuntimeError("Capital.com returned no candles for this request.")

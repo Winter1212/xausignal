@@ -84,8 +84,8 @@ RSI_OB = 80
 RSI_OS = 40
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
-ST_ATR_PERIOD = 8
-ST_FACTOR = 2.0
+ST_ATR_PERIOD = 4
+ST_FACTOR = 1.5
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
 
 # ---------------------- HIGHER TIMEFRAME CONFIRMATION ----------------------
@@ -116,10 +116,10 @@ FORCE_SKIP_IF_NEVER_VALID = os.environ.get("FORCE_SKIP_IF_NEVER_VALID", "false")
 
 # ---------------------- RISK MANAGEMENT ----------------------
 ATR_LEN = 20
-SL_MULT = 10
+SL_MULT = 10.0
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 2, 4, 4, 5
+RR1, RR2, RR3, RR4 = 2.0, 4.0, 4.0, 5.0
 
 # When TP1 is hit, the SL no longer jumps to pure breakeven. It moves to
 # entry +/- LOCK_PTS (in the trade's favor) instead, so a reversal after
@@ -130,7 +130,7 @@ LOCK_PTS = float(os.environ.get("LOCK_PTS", 10.0))
 
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 
-USE_TRAILING_RUNNER = True
+USE_TRAILING_RUNNER = False
 
 LOT_SIZE = float(os.environ.get("LOT_SIZE", 0.05))
 UNITS_PER_LOT = float(os.environ.get("UNITS_PER_LOT", 100))

@@ -56,8 +56,8 @@ TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 # open unless today (in FORCE_TIMEZONE) is one of the checked days.
 # Defaults match the indicator: Wed/Thu/Fri only.
 USE_DAY_FILTER = os.environ.get("USE_DAY_FILTER", "true").lower() == "true"
-TRADE_MON = os.environ.get("TRADE_MON", "false").lower() == "true"
-TRADE_TUE = os.environ.get("TRADE_TUE", "false").lower() == "true"
+TRADE_MON = os.environ.get("TRADE_MON", "true").lower() == "true"
+TRADE_TUE = os.environ.get("TRADE_TUE", "true").lower() == "true"
 TRADE_WED = os.environ.get("TRADE_WED", "true").lower() == "true"
 TRADE_THU = os.environ.get("TRADE_THU", "true").lower() == "true"
 TRADE_FRI = os.environ.get("TRADE_FRI", "true").lower() == "true"
@@ -79,8 +79,8 @@ _DAY_LABEL_FLAGS = [
 FAST_LEN = 30
 SLOW_LEN = 32
 USE_RSI = True
-RSI_LEN = 18
-RSI_OB = 70
+RSI_LEN = 20
+RSI_OB = 80
 RSI_OS = 40
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
@@ -96,7 +96,7 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 
 # ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION ----------------------
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
-PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.4))
+PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.6))
 PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 8))
 
 USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
@@ -115,11 +115,11 @@ FORCE_HARD_MINUTE = int(os.environ.get("FORCE_HARD_MINUTE", 45))
 FORCE_SKIP_IF_NEVER_VALID = os.environ.get("FORCE_SKIP_IF_NEVER_VALID", "false").lower() == "true"
 
 # ---------------------- RISK MANAGEMENT ----------------------
-ATR_LEN = 12
-SL_MULT = 1
+ATR_LEN = 20
+SL_MULT = 10
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 2, 3.5, 3.5, 4.5
+RR1, RR2, RR3, RR4 = 2, 4, 4, 5
 
 # When TP1 is hit, the SL no longer jumps to pure breakeven. It moves to
 # entry +/- LOCK_PTS (in the trade's favor) instead, so a reversal after

@@ -215,12 +215,12 @@ def _capital_prices_to_df(payload):
     for p in prices:
         o, c, h, l = p["openPrice"], p["closePrice"], p["highPrice"], p["lowPrice"]
         rows.append({
-            "datetime": p["snapshotTimeUTC"],
-            "open": (o["bid"] + o["ask"]) / 2,
-            "high": (h["bid"] + h["ask"]) / 2,
-            "low": (l["bid"] + l["ask"]) / 2,
-            "close": (c["bid"] + c["ask"]) / 2,
-        })
+        "datetime": p["snapshotTimeUTC"],
+        "open": o["bid"],
+        "high": h["bid"],
+        "low": l["bid"],
+        "close": c["bid"],
+    })
 
     df = pd.DataFrame(rows)
     df["datetime"] = (

@@ -119,7 +119,7 @@ ATR_LEN = 20
 SL_MULT = 10.0
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 2.0, 4.5, 4.5, 5.0
+RR1, RR2, RR3, RR4 = 2.0, 4.5, 5.5, 6.5
 
 # When TP1 is hit, the SL no longer jumps to pure breakeven. It moves to
 # entry +/- LOCK_PTS (in the trade's favor) instead, so a reversal after

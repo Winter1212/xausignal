@@ -126,7 +126,7 @@ RR1, RR2, RR3, RR4 = 2.0, 4.5, 5.5, 6.5
 # TP1 still books LOCK_PTS of profit rather than scratching at $0.
 # Mirrors the Pine indicator's "Lock Profit At TP1 (price points)" input
 # (default 10). Set to 0.0 to restore the old pure-breakeven behavior.
-LOCK_PTS = float(os.environ.get("LOCK_PTS", 10.0))
+LOCK_PTS = float(os.environ.get("LOCK_PTS", 5.0))
 
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 

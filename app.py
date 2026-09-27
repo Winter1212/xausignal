@@ -16,7 +16,7 @@ app = Flask(__name__)
 #   4. Set the three env vars below from that step: CAPITAL_API_KEY (the
 #      generated key), CAPITAL_IDENTIFIER (your login/email), and
 #      CAPITAL_PASSWORD (the custom API password you set, or your account
-#      password if you didn't set a custom one).
+#      password if you didn't sea custom one).
 CAPITAL_API_KEY    = os.environ.get("CAPITAL_API_KEY", "")
 CAPITAL_IDENTIFIER = os.environ.get("CAPITAL_IDENTIFIER", "")
 CAPITAL_PASSWORD   = os.environ.get("CAPITAL_PASSWORD", "")

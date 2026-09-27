@@ -245,9 +245,9 @@ def fetch_candles(interval, outputsize=500):
 def fetch_candles_range(interval, start_date, end_date, session_headers=None):
     """
     Same shape/contract as before -- pulls an explicit date range instead of
-    a fixed outputsize, used by the backtester. start_date/end_date are
-    naive datetimes in FORCE_TIMEZONE (as produced by run_backtest()); we
-    convert them to UTC before calling Capital.com.
+    a fixed outputsize, used by the signal-history walk-back. start_date/end_date
+    are naive datetimes in FORCE_TIMEZONE (as produced by run_signal_backtest());
+    we convert them to UTC before calling Capital.com.
 
     PAGINATION: Capital.com caps a single response at max=1000 candles, but
     it ALSO enforces its own (undocumented, resolution-dependent) cap on how
@@ -660,9 +660,9 @@ def trail_runner_sl(pos, st_value):
 # ---------------------- POSITION MANAGEMENT ----------------------
 def manage_position(state, last_candle, st_value, silent=False):
     """
-    silent=True is used by the backtester (run_backtest()) so replaying
-    history doesn't fire real Telegram alerts. Live /check calls this
-    with no third arg, so silent defaults to False and behavior there is
+    silent=True is used by the signal-history walk-back (run_signal_backtest())
+    so replaying history doesn't fire real Telegram alerts. Live /check calls
+    this with no third arg, so silent defaults to False and behavior there is
     unchanged.
     """
     pos = state["position"]
@@ -964,180 +964,10 @@ def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish
             state["pending_bar_time"] = None
 
 
-# ---------------------- BACKTEST ----------------------
-def run_backtest(days=30):
-    """
-    Replays the bot's real entry/exit/session/risk logic over the last
-    `days` days of history, using a fresh in-memory state (never touches
-    state.json / your live position), and returns a winrate report --
-    the equivalent of what the Pine Script shows on the TradingView
-    chart, but computed from your bot's actual Capital.com feed and actual
-    live logic instead of FXCM/Twelve Data chart data.
-    """
-    # fetch_candles_range() takes naive datetimes in FORCE_TIMEZONE and
-    # converts them to UTC internally before calling Capital.com.
-    end_date = pd.Timestamp.now(tz=FORCE_TIMEZONE).tz_localize(None)
-    # pad the fetch window so warm-up-hungry indicators (EMA32, ATR12,
-    # Supertrend, RSI16) are already stable by the time we reach the
-    # actual `days`-ago cutoff -- otherwise the first ~50-100 bars of
-    # the requested window would have garbage indicator values.
-    fetch_start = end_date - pd.Timedelta(days=days + 6)
-
-    df = fetch_candles_range(TIMEFRAME, fetch_start, end_date)
-    if len(df) < 50:
-        return {"error": f"Not enough candles returned ({len(df)}) to backtest. Try a shorter 'days' window."}
-
-    df["emaFast"] = ema(df["close"], FAST_LEN)
-    df["emaSlow"] = ema(df["close"], SLOW_LEN)
-    df["rsi"] = rsi(df["close"], RSI_LEN)
-    df["atr"] = atr(df, ATR_LEN)
-    st_series, dir_series = supertrend(df, ST_ATR_PERIOD, ST_FACTOR)
-    df["st"] = st_series
-    df["st_dir"] = dir_series
-
-    if USE_HTF:
-        htf_df = fetch_candles_range(HTF_TIMEFRAME, fetch_start, end_date)
-        _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
-        htf_df = htf_df[["datetime"]].copy()
-        htf_df["htf_st_dir"] = htf_dir_series.values
-        # align each entry-TF bar to the most recent CLOSED higher-TF bar
-        df = pd.merge_asof(df.sort_values("datetime"), htf_df.sort_values("datetime"),
-                            on="datetime", direction="backward")
-        df["htf_st_dir"] = df["htf_st_dir"].fillna(0).astype(int)
-    else:
-        df["htf_st_dir"] = 0
-
-    cutoff = end_date - pd.Timedelta(days=days)
-    cutoff_matches = df.index[df["datetime"] >= cutoff]
-    start_idx = int(cutoff_matches[0]) if len(cutoff_matches) else max(0, len(df) - 1)
-    start_idx = max(start_idx, 1)  # need a previous bar for cross detection
-
-    bt_state = {
-        "position": None,
-        "history": [],
-        "pending_dir": None,
-        "pending_bar_time": None,
-        "current_day": None,
-        "traded_today": False,
-        "force_attempted_today": False,
-        "force_skipped_today": False,
-        "stats": {"total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
-                   "best_trade": None, "worst_trade": None},
-    }
-
-    for i in range(start_idx, len(df)):
-        bar = df.iloc[i]
-        prev = df.iloc[i - 1]
-        bar_dt = bar["datetime"]
-
-        roll_daily_guarantee_state(bt_state, bar_dt)
-
-        if bt_state["position"] is not None:
-            manage_position(bt_state, bar, bar["st"], silent=True)
-
-        weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(bar_dt)
-
-        if blocked_now:
-            if bt_state["pending_dir"] is not None:
-                bt_state["pending_dir"] = None
-                bt_state["pending_bar_time"] = None
-            continue
-
-        if bt_state["position"] is not None:
-            continue  # already in a trade this bar, no new entry evaluation
-
-        ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and bar["emaFast"] > bar["emaSlow"]
-        ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and bar["emaFast"] < bar["emaSlow"]
-        rsi_ok_long = (not USE_RSI) or bar["rsi"] < RSI_OB
-        rsi_ok_short = (not USE_RSI) or bar["rsi"] > RSI_OS
-        st_bullish = bar["st_dir"] == 1
-        st_bearish = bar["st_dir"] == -1
-
-        bars_since_flip = bars_since_supertrend_flip(dir_series.iloc[:i + 1])
-        st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
-
-        h_dir = int(bar["htf_st_dir"])
-        htf_bullish = (not USE_HTF) or h_dir == 1
-        htf_bearish = (not USE_HTF) or h_dir == -1
-
-        extension_atr = (abs(bar["close"] - bar["emaFast"]) / bar["atr"]) if bar["atr"] > 0 else 0.0
-        extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
-        pullback_ok = extension_atr <= PULLBACK_MAX_ATR
-
-        base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
-        base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
-
-        roll_pullback_state(
-            bt_state, df.iloc[:i + 1], str(bar_dt), st_bullish, st_bearish, htf_bullish, htf_bearish,
-            base_long_cond, base_short_cond, entries_blocked=blocked_now,
-        )
-
-        if USE_PULLBACK_ENTRY:
-            long_cond = (extension_ok and bt_state["pending_dir"] == 1 and pullback_ok
-                         and st_bullish and htf_bullish and rsi_ok_long)
-            short_cond = (extension_ok and bt_state["pending_dir"] == -1 and pullback_ok
-                          and st_bearish and htf_bearish and rsi_ok_short)
-        else:
-            long_cond = extension_ok and base_long_cond
-            short_cond = extension_ok and base_short_cond
-
-        force_entry_now, force_direction = compute_force_entry(
-            bt_state, bar_dt, int(bar["st_dir"]), h_dir,
-            bar["emaFast"], bar["emaSlow"], bar["rsi"], extension_atr,
-        )
-        force_long_cond = force_entry_now and force_direction == 1
-        force_short_cond = force_entry_now and force_direction == -1
-
-        is_long_entry = long_cond or force_long_cond
-        is_short_entry = short_cond or force_short_cond
-
-        if is_long_entry or is_short_entry:
-            entry = bar["close"]
-            sl_dist = min(max(bar["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
-            if is_long_entry:
-                sl = entry - sl_dist
-                risk = entry - sl
-                tp1, tp2, tp3, tp4 = entry + risk * RR1, entry + risk * RR2, entry + risk * RR3, entry + risk * RR4
-                side = "BUY"
-            else:
-                sl = entry + sl_dist
-                risk = sl - entry
-                tp1, tp2, tp3, tp4 = entry - risk * RR1, entry - risk * RR2, entry - risk * RR3, entry - risk * RR4
-                side = "SELL"
-
-            bt_state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, str(bar_dt))
-            bt_state["traded_today"] = True
-            bt_state["force_attempted_today"] = True
-            bt_state["pending_dir"] = None
-            bt_state["pending_bar_time"] = None
-        elif force_entry_now:
-            bt_state["force_attempted_today"] = True
-
-    s = bt_state["stats"]
-    win_rate = (s["wins"] / s["total_trades"] * 100) if s["total_trades"] else 0
-
-    return {
-        "requested_days": days,
-        "data_covers_from": str(df.iloc[start_idx]["datetime"]),
-        "data_covers_to": str(df.iloc[-1]["datetime"]),
-        "total_candles_used": len(df) - start_idx,
-        "total_trades": s["total_trades"],
-        "wins": s["wins"],
-        "losses": s["losses"],
-        "win_rate": round(win_rate, 1),
-        "net_pnl": round(s["sum_pnl"], 2),
-        "best_trade": s["best_trade"],
-        "worst_trade": s["worst_trade"],
-        "trade_log": bt_state["history"],
-        "position_still_open_at_end": bt_state["position"],
-    }
-
-
 # ---------------------- SIGNAL-COUNT BACKTEST (last N signals) ----------------------
 def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
     """
-    Like run_backtest(), but instead of a fixed lookback window in days,
-    this keeps pulling further back in time -- via fetch_candles_range()'s
+    Walks back through Capital.com history -- via fetch_candles_range()'s
     pagination, so it isn't stuck at Capital.com's 1000-candle-per-request
     cap -- until it has replayed at least `target_count` of the bot's own
     trade signals (organic, pullback, or Forced Daily), then reports the
@@ -1636,44 +1466,6 @@ def stats():
         payload["telegram_notified"] = True
 
     return jsonify(payload)
-
-
-@app.route("/backtest", methods=["GET"])
-def backtest():
-    """
-    GET /backtest              -> last 30 days (default)
-    GET /backtest?days=14      -> last 14 days
-    GET /backtest?notify=true  -> also posts a summary to Telegram
-
-    Replays the bot's real signal/risk logic over historical Capital.com candles
-    and reports the winrate, trade count, net P&L, and full trade log --
-    the equivalent of what the Pine Script shows on the TradingView
-    chart, but from the bot's own data feed and own logic.
-    """
-    if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
-        return jsonify({"error": "Missing Capital.com credentials (CAPITAL_API_KEY / CAPITAL_IDENTIFIER / CAPITAL_PASSWORD)"}), 500
-
-    days = int(request.args.get("days", 30))
-    try:
-        result = run_backtest(days=days)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    if "error" in result:
-        return jsonify(result), 400
-
-    if _notify_requested():
-        msg = (
-            f"📊 [Backtest] XAUUSD — last {result['requested_days']}d\n"
-            f"Window: {result['data_covers_from']} -> {result['data_covers_to']}\n"
-            f"Win rate: {result['win_rate']}% "
-            f"({result['wins']}W / {result['losses']}L / {result['total_trades']} total)\n"
-            f"Net P&L: {'+' if result['net_pnl'] >= 0 else ''}${result['net_pnl']:.2f}"
-        )
-        send_telegram(msg)
-        result["telegram_notified"] = True
-
-    return jsonify(result)
 
 
 @app.route("/signals", methods=["GET"])

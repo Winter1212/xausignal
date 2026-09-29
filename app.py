@@ -77,10 +77,10 @@ _DAY_LABEL_FLAGS = [
 
 # ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
 FAST_LEN = 30
-SLOW_LEN = 32
+SLOW_LEN = 34
 USE_RSI = True
 RSI_LEN = 20
-RSI_OB = 80
+RSI_OB = 81
 RSI_OS = 40
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------

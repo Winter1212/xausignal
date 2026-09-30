@@ -6,6 +6,26 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
+# =====================================================================
+#  SYNCED WITH THE PINE INDICATOR ("Gold Signal Terminal")
+#  Changes in this revision:
+#   - Defaults now match the indicator settings you showed (RSI 80/40,
+#     Supertrend 8 / 2.0, pullback 1.2 ATR / 4 bars, extension 2.0 ATR,
+#     force-entry 09:00, SL = ATR x 1).
+#   - Supertrend is now the exact Pine ta.supertrend algorithm.
+#   - Entry signals are evaluated on the last CLOSED bar (the indicator
+#     acts at bar close), not on the still-forming candle.
+#   - HTF Supertrend uses the last COMPLETED higher-timeframe candle
+#     (the indicator's non-repainting request.security behaviour), for
+#     both live checks and the signal backtest.
+#   - Capital.com has no 2-hour candle, so "2h" is built by resampling
+#     1-hour candles (aligned to even UTC hours).
+#   - A signal can no longer open on the same bar where the previous
+#     trade just closed (same as the indicator).
+#   - Fixed: last_closed_bar_time was never initialised, so the closed-bar
+#     SL/TP backfill never actually ran.
+# =====================================================================
+
 # ---------------------- CONFG (env vars, set these in Render) ----------------------
 # Capital.com dem account access:
 #   1. Open a demo account: https://capital.com/
@@ -16,7 +36,7 @@ app = Flask(__name__)
 #   4. Set the three env vars below from that step: CAPITAL_API_KEY (the
 #      generated key), CAPITAL_IDENTIFIER (your login/email), and
 #      CAPITAL_PASSWORD (the custom API password you set, or your account
-#      password if you didn't sea custom one).
+#      password if you didn't set a custom one).
 CAPITAL_API_KEY    = os.environ.get("CAPITAL_API_KEY", "")
 CAPITAL_IDENTIFIER = os.environ.get("CAPITAL_IDENTIFIER", "")
 CAPITAL_PASSWORD   = os.environ.get("CAPITAL_PASSWORD", "")
@@ -32,12 +52,10 @@ TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOL               = os.environ.get("SYMBOL", "GOLD")
 TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
 
-
-# (see the big NOTE at the top of this file). Default matches the
-# indicator's "Force-Entry Timezone" input default ("Asia/Phnom_Penh",
-# Cambodia, UTC+7). This drives the Daily Trade Guarantee's day-boundary
-# AND its FORCE_HOUR/FORCE_MINUTE check below, AND (now) the weekend
-# no-new-signals guard below, AND the trading-hours guard below.
+# Default matches the indicator's "Force-Entry Timezone" / "Weekend-Check
+# Timezone" inputs ("Asia/Phnom_Penh", Cambodia, UTC+7). This drives the
+# Daily Trade Guarantee's day-boundary and FORCE_HOUR/FORCE_MINUTE check,
+# the weekend guard, the trading-hours guard and the day-of-week filter.
 FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 
 # ---------------------- WEEKEND GUARD ----------------------
@@ -54,7 +72,7 @@ TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 59))
 # Mirrors the indicator's "Day-of-Week Filter" group: when enabled, no
 # trade of any kind (organic, pullback, or Forced Daily) is allowed to
 # open unless today (in FORCE_TIMEZONE) is one of the checked days.
-# Defaults match the indicator: Wed/Thu/Fri only.
+# Defaults match the indicator: Tue/Wed/Thu/Fri only.
 USE_DAY_FILTER = os.environ.get("USE_DAY_FILTER", "true").lower() == "true"
 TRADE_MON = os.environ.get("TRADE_MON", "false").lower() == "true"
 TRADE_TUE = os.environ.get("TRADE_TUE", "true").lower() == "true"
@@ -80,12 +98,12 @@ FAST_LEN = 30
 SLOW_LEN = 34
 USE_RSI = True
 RSI_LEN = 20
-RSI_OB = 81
+RSI_OB = 80
 RSI_OS = 40
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
-ST_ATR_PERIOD = 4
-ST_FACTOR = 1.5
+ST_ATR_PERIOD = 8
+ST_FACTOR = 2.0
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
 
 # ---------------------- HIGHER TIMEFRAME CONFIRMATION ----------------------
@@ -96,15 +114,15 @@ HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 
 # ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION ----------------------
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
-PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.6))
-PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 8))
+PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.2))
+PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 4))
 
 USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
-MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.5))
+MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
 
 # ---------------------- DAILY TRADE GUARANTEE ----------------------
 GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
-FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 11))
+FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))
 
 FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "true"
@@ -116,7 +134,7 @@ FORCE_SKIP_IF_NEVER_VALID = os.environ.get("FORCE_SKIP_IF_NEVER_VALID", "false")
 
 # ---------------------- RISK MANAGEMENT ----------------------
 ATR_LEN = 20
-SL_MULT = 10.0
+SL_MULT = 1.0
 SL_MIN_PTS = 10.0
 SL_MAX_PTS = 10.0
 RR1, RR2, RR3, RR4 = 2.0, 4.5, 5.5, 6.5
@@ -124,8 +142,9 @@ RR1, RR2, RR3, RR4 = 2.0, 4.5, 5.5, 6.5
 # When TP1 is hit, the SL no longer jumps to pure breakeven. It moves to
 # entry +/- LOCK_PTS (in the trade's favor) instead, so a reversal after
 # TP1 still books LOCK_PTS of profit rather than scratching at $0.
-# Mirrors the Pine indicator's "Lock Profit At TP1 (price points)" input
-# (default 10). Set to 0.0 to restore the old pure-breakeven behavior.
+# Mirrors the Pine indicator's "SL Lock After TP1 (points beyond entry)"
+# input (default 5). Set to 0.0 to restore the old pure-breakeven behavior.
+# TP2 -> SL at TP1, TP3 -> SL at TP2 (same as the indicator).
 LOCK_PTS = float(os.environ.get("LOCK_PTS", 5.0))
 
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
@@ -141,8 +160,8 @@ STATE_FILE = "state.json"
 # ---------------------- CAPITAL.COM DATA FETCHING ----------------------
 # Capital.com's resolution codes don't match Twelve Data's interval strings,
 # so we translate. Keep using the same TIMEFRAME / HTF_TIMEFRAME env values
-# you already had ("5min", "4h", etc.) -- only this map needs to know about
-# Capital.com's naming.
+# you already had ("5min", "2h", "4h", etc.) -- only this map needs to know
+# about Capital.com's naming.
 _CAPITAL_RESOLUTION_MAP = {
     "1min": "MINUTE", "5min": "MINUTE_5", "15min": "MINUTE_15", "30min": "MINUTE_30",
     "45min": "MINUTE_30",  # no 45-minute resolution; falls back if ever used
@@ -150,12 +169,19 @@ _CAPITAL_RESOLUTION_MAP = {
     "1day": "DAY", "1week": "WEEK",
 }
 
+# Capital.com has no native 2-hour candle. For these intervals we fetch the
+# base interval and resample it: {interval: (base_interval, hours_per_bar)}.
+_RESAMPLE_FROM = {
+    "2h": ("1h", 2),
+}
+
 # Duration of one candle per interval, in minutes. Used to figure out how
 # far a single <=1000-candle Capital.com request can reach, so multi-chunk
-# pagination (see fetch_candles_range) knows how wide to make each chunk.
+# pagination (see fetch_candles_range) knows how wide to make each chunk,
+# and to line the higher-timeframe series up without look-ahead.
 _INTERVAL_MINUTES = {
     "1min": 1, "5min": 5, "15min": 15, "30min": 30, "45min": 30,
-    "1h": 60, "4h": 240, "1day": 1440, "1week": 10080,
+    "1h": 60, "2h": 120, "4h": 240, "1day": 1440, "1week": 10080,
 }
 
 
@@ -206,7 +232,7 @@ def _capital_prices_to_df(payload):
     """Capital.com returns a 'prices' list of bid/ask OHLC candles with a
     snapshotTimeUTC field. Convert to the same shape the rest of this file
     expects: a 'datetime' column (naive, in FORCE_TIMEZONE) plus
-    open/high/low/close (mid prices)."""
+    open/high/low/close (bid prices)."""
     prices = payload.get("prices", [])
     if not prices:
         raise RuntimeError("Capital.com returned no candles for this request.")
@@ -215,12 +241,12 @@ def _capital_prices_to_df(payload):
     for p in prices:
         o, c, h, l = p["openPrice"], p["closePrice"], p["highPrice"], p["lowPrice"]
         rows.append({
-        "datetime": p["snapshotTimeUTC"],
-        "open": o["bid"],
-        "high": h["bid"],
-        "low": l["bid"],
-        "close": c["bid"],
-    })
+            "datetime": p["snapshotTimeUTC"],
+            "open": o["bid"],
+            "high": h["bid"],
+            "low": l["bid"],
+            "close": c["bid"],
+        })
 
     df = pd.DataFrame(rows)
     df["datetime"] = (
@@ -233,7 +259,47 @@ def _capital_prices_to_df(payload):
     return df
 
 
+def _resample_candles(df, hours):
+    """
+    Build N-hour candles out of 1-hour candles (Capital.com has no 2h
+    resolution). Buckets are aligned to UTC midnight, i.e. even UTC hours
+    for 2h bars -- the closest stand-in for TradingView's 2h chart. The
+    'datetime' column is naive FORCE_TIMEZONE, like every other frame here,
+    so we round-trip through UTC to keep the alignment independent of the
+    display timezone.
+    """
+    tmp = df.copy()
+    tmp["utc"] = (
+        tmp["datetime"]
+        .dt.tz_localize(FORCE_TIMEZONE, ambiguous="NaT", nonexistent="shift_forward")
+        .dt.tz_convert("UTC")
+    )
+    tmp = tmp.dropna(subset=["utc"]).set_index("utc")
+
+    rule = f"{hours}h"
+    agg = tmp.resample(rule, origin="start_day").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}
+    )
+    counts = tmp["close"].resample(rule, origin="start_day").count()
+    agg = agg[counts > 0].dropna()
+    counts = counts[counts > 0]
+
+    # the very first bucket is usually cut in half by where the fetch
+    # window starts -- drop it rather than feed a partial candle in.
+    if len(agg) > 1 and counts.iloc[0] < hours:
+        agg = agg.iloc[1:]
+
+    agg.index = agg.index.tz_convert(FORCE_TIMEZONE).tz_localize(None)
+    agg.index.name = "datetime"
+    return agg.reset_index()[["datetime", "open", "high", "low", "close"]]
+
+
 def fetch_candles(interval, outputsize=500):
+    if interval in _RESAMPLE_FROM:
+        base_interval, factor = _RESAMPLE_FROM[interval]
+        base_df = fetch_candles(base_interval, outputsize=min(outputsize * factor, 1000))
+        return _resample_candles(base_df, factor)
+
     headers = _capital_session_headers()
     params = {"resolution": _capital_resolution(interval), "max": min(outputsize, 1000)}
     r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=15)
@@ -270,6 +336,14 @@ def fetch_candles_range(interval, start_date, end_date, session_headers=None):
     important once a fetch needs more than one or two chunks. If omitted,
     a session is opened here and used for the whole call.
     """
+    if interval in _RESAMPLE_FROM:
+        base_interval, factor = _RESAMPLE_FROM[interval]
+        base_df = fetch_candles_range(
+            base_interval, pd.Timestamp(start_date) - pd.Timedelta(hours=factor), end_date,
+            session_headers=session_headers,
+        )
+        return _resample_candles(base_df, factor)
+
     own_session = session_headers is None
     headers = session_headers or _capital_session_headers()
 
@@ -374,45 +448,49 @@ def atr(df, length):
 
 
 def supertrend(df, period, factor):
-    hl2 = (df["high"] + df["low"]) / 2
-    atr_val = true_range(df).ewm(alpha=1 / period, adjust=False).mean()
-    upperband = hl2 + factor * atr_val
-    lowerband = hl2 - factor * atr_val
+    """
+    Same algorithm as Pine's ta.supertrend (the band-clamping rules and the
+    flip test against the CURRENT final band). direction: 1 = bullish
+    (line under price), -1 = bearish. Pine itself starts on the first bar
+    in the bearish state, so we do too.
+    """
+    hl2 = ((df["high"] + df["low"]) / 2).tolist()
+    close = df["close"].tolist()
+    atr_val = true_range(df).ewm(alpha=1 / period, adjust=False).mean().tolist()
 
-    final_upper = upperband.copy()
-    final_lower = lowerband.copy()
-    direction = pd.Series(index=df.index, dtype="int64")
-    st = pd.Series(index=df.index, dtype="float64")
+    n = len(df)
+    final_upper = [0.0] * n
+    final_lower = [0.0] * n
+    direction = [0] * n
+    st = [0.0] * n
 
-    for i in range(len(df)):
+    for i in range(n):
+        upper = hl2[i] + factor * atr_val[i]
+        lower = hl2[i] - factor * atr_val[i]
+
         if i == 0:
-            final_upper.iloc[i] = upperband.iloc[i]
-            final_lower.iloc[i] = lowerband.iloc[i]
-            direction.iloc[i] = 1
-            st.iloc[i] = final_lower.iloc[i]
-            continue
-
-        final_upper.iloc[i] = (
-            upperband.iloc[i]
-            if (upperband.iloc[i] < final_upper.iloc[i - 1] or df["close"].iloc[i - 1] > final_upper.iloc[i - 1])
-            else final_upper.iloc[i - 1]
-        )
-        final_lower.iloc[i] = (
-            lowerband.iloc[i]
-            if (lowerband.iloc[i] > final_lower.iloc[i - 1] or df["close"].iloc[i - 1] < final_lower.iloc[i - 1])
-            else final_lower.iloc[i - 1]
-        )
-
-        if df["close"].iloc[i] > final_upper.iloc[i - 1]:
-            direction.iloc[i] = 1
-        elif df["close"].iloc[i] < final_lower.iloc[i - 1]:
-            direction.iloc[i] = -1
+            final_upper[i] = upper
+            final_lower[i] = lower
+            direction[i] = -1
         else:
-            direction.iloc[i] = direction.iloc[i - 1]
+            prev_upper = final_upper[i - 1]
+            prev_lower = final_lower[i - 1]
+            final_lower[i] = lower if (lower > prev_lower or close[i - 1] < prev_lower) else prev_lower
+            final_upper[i] = upper if (upper < prev_upper or close[i - 1] > prev_upper) else prev_upper
 
-        st.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+            if direction[i - 1] == -1:
+                # was riding the upper band -> flips bullish once close clears it
+                direction[i] = 1 if close[i] > final_upper[i] else -1
+            else:
+                # was riding the lower band -> flips bearish once close breaks it
+                direction[i] = -1 if close[i] < final_lower[i] else 1
 
-    return st, direction
+        st[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
+
+    return (
+        pd.Series(st, index=df.index, dtype="float64"),
+        pd.Series(direction, index=df.index, dtype="int64"),
+    )
 
 
 def bars_since_supertrend_flip(dir_series):
@@ -457,6 +535,18 @@ def is_new_entries_blocked(bar_dt):
     outside_hours = is_outside_trading_hours(bar_dt)
     day_blocked = is_day_blocked(bar_dt)
     return weekend, outside_hours, day_blocked, (weekend or outside_hours or day_blocked)
+
+
+def htf_direction_from_series(htf_dir_series):
+    """
+    Direction of the last COMPLETED higher-timeframe candle. The newest HTF
+    candle from Capital.com is still forming; the indicator's
+    request.security(..., lookahead_off) doesn't repaint on a candle that
+    hasn't closed, so neither do we.
+    """
+    if len(htf_dir_series) > 1:
+        return int(htf_dir_series.iloc[-2])
+    return int(htf_dir_series.iloc[-1])
 
 
 # ---------------------- STATE ----------------------
@@ -628,9 +718,8 @@ def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
 
 # ---------------------- RATCHET HELPERS ----------------------
 def ratchet_to_breakeven(pos):
-    # Was: pos["sl"] = pos["entry"]  (pure breakeven, locks $0)
-    # Now: SL moves to entry +/- LOCK_PTS in the trade's favor, so a
-    # reversal after TP1 still books LOCK_PTS of profit instead of $0.
+    # TP1 hit: SL moves to entry +/- LOCK_PTS in the trade's favor (not pure
+    # breakeven), so a reversal after TP1 still books LOCK_PTS of profit.
     pos["tp1_hit"] = True
     pos["remaining_size"] = 0.75
     pos["sl"] = pos["entry"] + LOCK_PTS if pos["dir"] == 1 else pos["entry"] - LOCK_PTS
@@ -982,6 +1071,10 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
     paginated chunk and every HTF fetch in this call, since re-logging-in
     per chunk would be slow and can hit rate limits once history spans
     weeks or months.
+
+    Only CLOSED bars are replayed (the still-forming candle is dropped),
+    and each chart bar only sees a higher-timeframe candle once that HTF
+    candle has fully closed -- no look-ahead.
     """
     headers = _capital_session_headers()
     days = initial_days
@@ -994,6 +1087,8 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
         fetch_start = end_date - pd.Timedelta(days=days + 6)
 
         df = fetch_candles_range(TIMEFRAME, fetch_start, end_date, session_headers=headers)
+        if len(df) > 1:
+            df = df.iloc[:-1].reset_index(drop=True)  # drop the still-forming candle
         if len(df) < 50:
             if days >= max_days:
                 return {"error": f"Not enough candles returned ({len(df)}) even at the {max_days}-day cap."}
@@ -1013,6 +1108,12 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
             _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
             htf_df = htf_df[["datetime"]].copy()
             htf_df["htf_st_dir"] = htf_dir_series.values
+            # A chart bar may only see an HTF candle once that candle has
+            # closed: shift each HTF timestamp (candle OPEN time) forward to
+            # the open time of the last chart bar inside it.
+            htf_minutes = _INTERVAL_MINUTES.get(HTF_TIMEFRAME, 240)
+            tf_minutes = _INTERVAL_MINUTES.get(TIMEFRAME, 5)
+            htf_df["datetime"] = htf_df["datetime"] + pd.Timedelta(minutes=max(htf_minutes - tf_minutes, 0))
             df = pd.merge_asof(df.sort_values("datetime"), htf_df.sort_values("datetime"),
                                 on="datetime", direction="backward")
             df["htf_st_dir"] = df["htf_st_dir"].fillna(0).astype(int)
@@ -1054,6 +1155,9 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
                         "pnl": closed["pnl"],
                     })
                     open_signal_idx = None
+                # a position that was open coming into this bar (even if it
+                # just closed on it) blocks a new entry on this same bar
+                continue
 
             weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(bar_dt)
 
@@ -1061,9 +1165,6 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
                 if bt_state["pending_dir"] is not None:
                     bt_state["pending_dir"] = None
                     bt_state["pending_bar_time"] = None
-                continue
-
-            if bt_state["position"] is not None:
                 continue
 
             ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and bar["emaFast"] > bar["emaSlow"]
@@ -1193,71 +1294,74 @@ def check():
     df["st"] = st_series
     df["st_dir"] = dir_series
 
-    last = df.iloc[-1]
+    # The newest candle from Capital.com is still forming. Like the
+    # indicator (which acts at bar close), NEW SIGNALS are evaluated on the
+    # last CLOSED bar only; the forming candle is used just to catch SL/TP
+    # touches intrabar.
+    live = df.iloc[-1]
+    sig_df = df.iloc[:-1].reset_index(drop=True)
+    if len(sig_df) < 3:
+        return jsonify({"error": "Not enough closed candles returned."}), 500
+    last = sig_df.iloc[-1]
+    prev = sig_df.iloc[-2]
+    sig_dir_series = sig_df["st_dir"]
     bar_time = str(last["datetime"])
 
     state = load_state()
-    result = {"bar_time": bar_time, "event": None}
+    result = {"bar_time": bar_time, "live_bar_time": str(live["datetime"]), "event": None}
 
     # ---------------------------------------------------------------
-    # LAG FIX (v2): the previous version of this endpoint (and the first
-    # patch of this fix) deduped position-management by bar timestamp --
-    # "if we've already processed this bar_time, skip." That's wrong for
-    # the CURRENT bar: Capital.com (like the providers before it) returns the still-
-    # forming candle with a live-updating high/low as price moves inside
-    # it, so a 5min timeframe polled every 2min shows the SAME bar
-    # timestamp 2-3 times before that candle finally closes. Deduping by
-    # timestamp meant only the FIRST poll of that candle ever checked its
-    # high/low against SL/TP -- every later poll (where the candle's low
-    # had actually dropped further, or high risen further) was skipped
-    # entirely. That's exactly how an SL can visibly trade through on the
-    # live chart while the bot still shows the position open.
-    #
-    # Fix: split management into two passes.
-    #   (a) Backfill fully CLOSED bars we haven't processed yet (covers a
+    # POSITION MANAGEMENT, two passes:
+    #   (a) backfill fully CLOSED bars we haven't processed yet (covers a
     #       poller outage/slow cron skipping whole bars) -- deduped by
     #       state["last_closed_bar_time"] since closed bars never change.
-    #   (b) ALWAYS re-check the current (possibly still-forming) last bar
-    #       on every single poll, no dedup -- this is what actually catches
-    #       an SL/TP touched mid-candle. manage_position() is safe to call
-    #       repeatedly: it only acts on tp1_hit/tp2_hit/tp3_hit flags and a
-    #       monotonically growing high/low, so re-checking the same
-    #       (bigger) high/low again can't double-fire or un-trigger
-    #       anything.
+    #   (b) ALWAYS re-check the current (possibly still-forming) candle on
+    #       every poll, no dedup -- this is what catches an SL/TP touched
+    #       mid-candle. manage_position() is safe to call repeatedly: it
+    #       only acts on tp1_hit/tp2_hit/tp3_hit flags and a monotonically
+    #       growing high/low, so it can't double-fire or un-trigger.
     # ---------------------------------------------------------------
     last_closed_str = state.get("last_closed_bar_time")
-    if last_closed_str and len(df) > 1:
+    if last_closed_str:
         last_closed_ts = pd.to_datetime(last_closed_str)
-        closed_backlog = df.iloc[:-1]
-        closed_backlog = closed_backlog[closed_backlog["datetime"] > last_closed_ts]
+        closed_backlog = sig_df[sig_df["datetime"] > last_closed_ts]
     else:
-        closed_backlog = df.iloc[0:0]
+        closed_backlog = sig_df.iloc[0:0]
 
     any_managed_event = False
+    # Was a position already open going INTO the signal bar? (The indicator
+    # only looks for an entry when it is flat at that point -- a trade that
+    # closes ON the signal bar doesn't allow a new entry on that same bar.)
+    flat_before_signal_bar = None
 
     # (a) backfill any closed bars we haven't processed yet
     for _, bar in closed_backlog.iterrows():
+        if str(bar["datetime"]) == bar_time:
+            flat_before_signal_bar = state["position"] is None
         roll_daily_guarantee_state(state, bar["datetime"])
         if state["position"] is not None:
             any_managed_event = manage_position(state, bar, bar["st"]) or any_managed_event
         state["last_closed_bar_time"] = str(bar["datetime"])
 
-    # (b) always re-check the current/latest bar, dedup or not
+    if flat_before_signal_bar is None:
+        flat_before_signal_bar = state["position"] is None
+    if state.get("last_closed_bar_time") is None:
+        state["last_closed_bar_time"] = bar_time
     roll_daily_guarantee_state(state, last["datetime"])
+
+    # (b) always re-check the current/latest candle, dedup or not
     if state["position"] is not None:
-        any_managed_event = manage_position(state, last, last["st"]) or any_managed_event
+        any_managed_event = manage_position(state, live, live["st"]) or any_managed_event
 
     if any_managed_event:
         result["event"] = "position_update"
     save_state(state)
 
-    # 1b) Session guard: don't evaluate/open any NEW signal (organic or
-    #     forced) while the current bar is a Saturday/Sunday in
-    #     FORCE_TIMEZONE, OR while it's outside the configured trading-hours
-    #     window, OR while today isn't a selected trading day. Still update
-    #     last_signal_bar so we don't just spin re-checking the same closed
-    #     bar. Also explicitly clears any pending pullback signal that was
-    #     armed before the block started.
+    # Session guard: don't evaluate/open any NEW signal (organic or forced)
+    # while the signal bar is a Saturday/Sunday in FORCE_TIMEZONE, OR outside
+    # the configured trading-hours window, OR on an unselected trading day.
+    # Also explicitly clears any pending pullback signal that was armed
+    # before the block started.
     weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(last["datetime"])
     if blocked_now:
         state["last_signal_bar"] = bar_time
@@ -1269,135 +1373,134 @@ def check():
         result["day_skipped"] = day_blocked_now
         save_state(state)
 
-    # 2) Only look for a NEW entry if we're currently flat, it's not a bar
-    #    we've already processed, and it's not weekend/outside trading hours/
-    #    an unselected day.
-    if (not blocked_now) and state["position"] is None and state.get("last_signal_bar") != bar_time:
-        prev = df.iloc[-2]
+    # Only look for a NEW entry once per closed bar, and only if we were flat
+    # going into that bar and it isn't blocked by the session filters.
+    elif state.get("last_signal_bar") != bar_time:
+        state["last_signal_bar"] = bar_time  # mark this closed bar as handled
 
-        ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and last["emaFast"] > last["emaSlow"]
-        ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and last["emaFast"] < last["emaSlow"]
+        if flat_before_signal_bar and state["position"] is None:
+            ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and last["emaFast"] > last["emaSlow"]
+            ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and last["emaFast"] < last["emaSlow"]
 
-        rsi_ok_long = (not USE_RSI) or last["rsi"] < RSI_OB
-        rsi_ok_short = (not USE_RSI) or last["rsi"] > RSI_OS
+            rsi_ok_long = (not USE_RSI) or last["rsi"] < RSI_OB
+            rsi_ok_short = (not USE_RSI) or last["rsi"] > RSI_OS
 
-        st_bullish = last["st_dir"] == 1
-        st_bearish = last["st_dir"] == -1
+            st_bullish = last["st_dir"] == 1
+            st_bearish = last["st_dir"] == -1
 
-        bars_since_flip = bars_since_supertrend_flip(dir_series)
-        st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
+            bars_since_flip = bars_since_supertrend_flip(sig_dir_series)
+            st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
 
-        htf_dir = 0
-        if USE_HTF:
-            htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=500)
-            _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
-            htf_dir = int(htf_dir_series.iloc[-1])
-        htf_bullish = (not USE_HTF) or htf_dir == 1
-        htf_bearish = (not USE_HTF) or htf_dir == -1
+            htf_dir = 0
+            if USE_HTF:
+                htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=500)
+                _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
+                htf_dir = htf_direction_from_series(htf_dir_series)
+            htf_bullish = (not USE_HTF) or htf_dir == 1
+            htf_bearish = (not USE_HTF) or htf_dir == -1
 
-        extension_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
-        extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
+            extension_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
+            extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
 
-        pullback_dist_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
-        pullback_ok = pullback_dist_atr <= PULLBACK_MAX_ATR
+            pullback_dist_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
+            pullback_ok = pullback_dist_atr <= PULLBACK_MAX_ATR
 
-        base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
-        base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
+            base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
+            base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
 
-        roll_pullback_state(
-            state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
-            base_long_cond, base_short_cond, entries_blocked=blocked_now,
-        )
-
-        if USE_PULLBACK_ENTRY:
-            long_cond = (
-                extension_ok and state["pending_dir"] == 1 and pullback_ok
-                and st_bullish and htf_bullish and rsi_ok_long
+            roll_pullback_state(
+                state, sig_df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
+                base_long_cond, base_short_cond, entries_blocked=blocked_now,
             )
-            short_cond = (
-                extension_ok and state["pending_dir"] == -1 and pullback_ok
-                and st_bearish and htf_bearish and rsi_ok_short
-            )
-        else:
-            long_cond = extension_ok and base_long_cond
-            short_cond = extension_ok and base_short_cond
 
-        force_entry_now, force_direction = compute_force_entry(
-            state, last["datetime"], int(last["st_dir"]), htf_dir,
-            last["emaFast"], last["emaSlow"],
-            last["rsi"], extension_atr,
-        )
-        force_long_cond = force_entry_now and force_direction == 1
-        force_short_cond = force_entry_now and force_direction == -1
-
-        is_long_entry = long_cond or force_long_cond
-        is_short_entry = short_cond or force_short_cond
-
-        state["last_signal_bar"] = bar_time
-        result["pending"] = {
-            "dir": state["pending_dir"],
-            "extension_atr": round(extension_atr, 3),
-            "extension_ok": extension_ok,
-        }
-
-        if is_long_entry or is_short_entry:
-            entry = last["close"]
-            sl_dist = min(max(last["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
-
-            if is_long_entry:
-                sl = entry - sl_dist
-                risk = entry - sl
-                tp1 = entry + risk * RR1
-                tp2 = entry + risk * RR2
-                tp3 = entry + risk * RR3
-                tp4 = entry + risk * RR4
-                side = "BUY"
-                is_forced = force_long_cond and not long_cond
+            if USE_PULLBACK_ENTRY:
+                long_cond = (
+                    extension_ok and state["pending_dir"] == 1 and pullback_ok
+                    and st_bullish and htf_bullish and rsi_ok_long
+                )
+                short_cond = (
+                    extension_ok and state["pending_dir"] == -1 and pullback_ok
+                    and st_bearish and htf_bearish and rsi_ok_short
+                )
             else:
-                sl = entry + sl_dist
-                risk = sl - entry
-                tp1 = entry - risk * RR1
-                tp2 = entry - risk * RR2
-                tp3 = entry - risk * RR3
-                tp4 = entry - risk * RR4
-                side = "SELL"
-                is_forced = force_short_cond and not short_cond
+                long_cond = extension_ok and base_long_cond
+                short_cond = extension_ok and base_short_cond
 
-            state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time)
-            state["traded_today"] = True
-            state["force_attempted_today"] = True
-            state["pending_dir"] = None
-            state["pending_bar_time"] = None
-
-            is_pullback = USE_PULLBACK_ENTRY and not is_forced
-            tag = "(Forced Daily)" if is_forced else "(Supertrend, Pullback)" if is_pullback else "(Supertrend)"
-            htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(htf_dir)}\n" if USE_HTF else ""
-            msg = (
-                f"XAUUSD {side} signal {tag}\n"
-                f"Entry: {entry:.2f}\n"
-                f"SL: {sl:.2f}\n"
-                f"TP1: {tp1:.2f}\n"
-                f"TP2: {tp2:.2f}\n"
-                f"TP3: {tp3:.2f}\n"
-                f"TP4: {tp4:.2f}\n"
-                f"Supertrend ({TIMEFRAME}): {trend_arrow(last['st_dir'])}\n"
-                f"{htf_line}"
-                f"Bar: {bar_time} ({FORCE_TIMEZONE})"
+            force_entry_now, force_direction = compute_force_entry(
+                state, last["datetime"], int(last["st_dir"]), htf_dir,
+                last["emaFast"], last["emaSlow"],
+                last["rsi"], extension_atr,
             )
-            send_telegram(msg)
-            result["event"] = "entry"
-            result["side"] = side
-            result["forced"] = is_forced
-            result["pullback"] = is_pullback
-            result["message"] = msg
-            result["entry"] = entry
-            result["sl"] = sl
-            result["tp1"] = tp1
-            result["tp2"] = tp2
-            result["tp3"] = tp3
-            result["tp4"] = tp4
-        elif force_entry_now:
-            state["force_attempted_today"] = True
+            force_long_cond = force_entry_now and force_direction == 1
+            force_short_cond = force_entry_now and force_direction == -1
+
+            is_long_entry = long_cond or force_long_cond
+            is_short_entry = short_cond or force_short_cond
+
+            result["pending"] = {
+                "dir": state["pending_dir"],
+                "extension_atr": round(extension_atr, 3),
+                "extension_ok": extension_ok,
+            }
+
+            if is_long_entry or is_short_entry:
+                entry = last["close"]
+                sl_dist = min(max(last["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
+
+                if is_long_entry:
+                    sl = entry - sl_dist
+                    risk = entry - sl
+                    tp1 = entry + risk * RR1
+                    tp2 = entry + risk * RR2
+                    tp3 = entry + risk * RR3
+                    tp4 = entry + risk * RR4
+                    side = "BUY"
+                    is_forced = force_long_cond and not long_cond
+                else:
+                    sl = entry + sl_dist
+                    risk = sl - entry
+                    tp1 = entry - risk * RR1
+                    tp2 = entry - risk * RR2
+                    tp3 = entry - risk * RR3
+                    tp4 = entry - risk * RR4
+                    side = "SELL"
+                    is_forced = force_short_cond and not short_cond
+
+                state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time)
+                state["traded_today"] = True
+                state["force_attempted_today"] = True
+                state["pending_dir"] = None
+                state["pending_bar_time"] = None
+
+                is_pullback = USE_PULLBACK_ENTRY and not is_forced
+                tag = "(Forced Daily)" if is_forced else "(Supertrend, Pullback)" if is_pullback else "(Supertrend)"
+                htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(htf_dir)}\n" if USE_HTF else ""
+                msg = (
+                    f"XAUUSD {side} signal {tag}\n"
+                    f"Entry: {entry:.2f}\n"
+                    f"SL: {sl:.2f}\n"
+                    f"TP1: {tp1:.2f}\n"
+                    f"TP2: {tp2:.2f}\n"
+                    f"TP3: {tp3:.2f}\n"
+                    f"TP4: {tp4:.2f}\n"
+                    f"Supertrend ({TIMEFRAME}): {trend_arrow(last['st_dir'])}\n"
+                    f"{htf_line}"
+                    f"Bar: {bar_time} ({FORCE_TIMEZONE})"
+                )
+                send_telegram(msg)
+                result["event"] = "entry"
+                result["side"] = side
+                result["forced"] = is_forced
+                result["pullback"] = is_pullback
+                result["message"] = msg
+                result["entry"] = entry
+                result["sl"] = sl
+                result["tp1"] = tp1
+                result["tp2"] = tp2
+                result["tp3"] = tp3
+                result["tp4"] = tp4
+            elif force_entry_now:
+                state["force_attempted_today"] = True
 
         save_state(state)
 
@@ -1577,6 +1680,11 @@ def health():
         "capital_configured": bool(CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD),
         "capital_base_url": CAPITAL_BASE_URL,
         "symbol": SYMBOL,
+        "timeframe": TIMEFRAME,
+        "signals_evaluated_on": "last closed bar",
+        "supertrend": f"ATR {ST_ATR_PERIOD} / factor {ST_FACTOR}",
+        "rsi": f"len {RSI_LEN}, block buys > {RSI_OB}, block sells < {RSI_OS}",
+        "ema": f"{FAST_LEN}/{SLOW_LEN}",
         "use_htf": USE_HTF,
         "htf_timeframe": HTF_TIMEFRAME if USE_HTF else None,
         "st_confirm_bars": ST_CONFIRM_BARS,

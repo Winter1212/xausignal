@@ -90,7 +90,7 @@ ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
 
 # ---------------------- HIGHER TIMEFRAME CONFIRMATION ----------------------
 USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
-HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "4h")
+HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "2h")
 HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 4))
 HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
 

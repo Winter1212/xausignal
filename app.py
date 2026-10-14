@@ -95,9 +95,9 @@ _DAY_LABEL_FLAGS = [
 
 # ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
 FAST_LEN = 30
-SLOW_LEN = 34
+SLOW_LEN = 35
 USE_RSI = True
-RSI_LEN = 20
+RSI_LEN = 24
 RSI_OB = 80
 RSI_OS = 40
 

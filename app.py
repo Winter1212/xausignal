@@ -6,7 +6,7 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
-# ====================================================================
+# ===================================================================
 #  SYNCED WITH THE PINE INDICATOR ("Gold Signal Terminal")
 #  Changes in this revision:
 #   - Defaults now match the indicator settings you showed (RSI 80/40,
@@ -145,7 +145,7 @@ RR1, RR2, RR3, RR4 = 2.0, 4.8, 5.8, 6.5
 # Mirrors the Pine indicator's "SL Lock After TP1 (points beyond entry)"
 # input (default 5). Set to 0.0 to restore the old pure-breakeven behavior.
 # TP2 -> SL at TP1, TP3 -> SL at TP2 (same as the indicator).
-LOCK_PTS = float(os.environ.get("LOCK_PTS", 7.5))
+LOCK_PTS = float(os.environ.get("LOCK_PTS", 9.0))
 
 PNL_MODE = os.environ.get("PNL_MODE", "partial")
 

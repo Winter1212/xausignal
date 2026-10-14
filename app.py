@@ -6,7 +6,7 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
-# =====================================================================
+# ====================================================================
 #  SYNCED WITH THE PINE INDICATOR ("Gold Signal Terminal")
 #  Changes in this revision:
 #   - Defaults now match the indicator settings you showed (RSI 80/40,

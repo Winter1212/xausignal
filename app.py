@@ -5,6 +5,8 @@ import pandas as pd
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
+from ea_control import register_ea_control
+inject_ea_ui = register_ea_control(app)
 
 # ===================================================================
 #  SYNCED WITH THE PINE INDICATOR ("Gold Signal Terminal")

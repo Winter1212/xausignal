@@ -1718,7 +1718,7 @@ def health():
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
-    return Response(DASHBOARD_HTML, mimetype="text/html")
+    return Response(inject_ea_ui(DASHBOARD_HTML), mimetype="text/html")
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>

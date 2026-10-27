@@ -127,7 +127,7 @@ GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() 
 FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))
 FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))
 
-FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "true"
+FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "false"
 
 FORCE_HARD_HOUR   = int(os.environ.get("FORCE_HARD_HOUR", 23))
 FORCE_HARD_MINUTE = int(os.environ.get("FORCE_HARD_MINUTE", 45))

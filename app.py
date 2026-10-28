@@ -104,20 +104,20 @@ RSI_OB = 80
 RSI_OS = 40
 
 # ---------------------- SUPERTREND TREND FILTER ----------------------
-ST_ATR_PERIOD = 8
+ST_ATR_PERIOD = 12
 ST_FACTOR = 2.0
 ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
 
 # ---------------------- HIGHER TIMEFRAME CONFIRMATION ----------------------
 USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
 HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "2h")
-HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 4))
-HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 8))
+HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 8))
+HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 4))
 
 # ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION ----------------------
 USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
-PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.2))
-PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 4))
+PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.35))
+PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 2))
 
 USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
 MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
@@ -149,7 +149,7 @@ RR1, RR2, RR3, RR4 = 2.0, 4.8, 5.8, 6.5
 # TP2 -> SL at TP1, TP3 -> SL at TP2 (same as the indicator).
 LOCK_PTS = float(os.environ.get("LOCK_PTS", 9.0))
 
-PNL_MODE = os.environ.get("PNL_MODE", "partial")
+PNL_MODE = os.environ.get("PNL_MODE", "tp1_only")
 
 USE_TRAILING_RUNNER = False
 

@@ -8,7 +8,7 @@ app = Flask(__name__)
 from ea_control import register_ea_control
 inject_ea_ui = register_ea_control(app)
 
-# ==================================================================
+# =================================================================
 #  SYNCED WITH THE PINE INDICATOR ("Gold Signal Terminal")
 #  Changes in this revision:
 #   - Defaults now match the indicator settings you showed (RSI 80/40,

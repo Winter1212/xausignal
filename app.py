@@ -67,8 +67,8 @@ DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lowe
 USE_TRADING_HOURS   = os.environ.get("USE_TRADING_HOURS", "true").lower() == "true"
 TRADING_START_HOUR   = int(os.environ.get("TRADING_START_HOUR", 6))
 TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
-TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 23))
-TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 30))
+TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 22))
+TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 00))
 
 # ---------------------- DAY-OF-WEEK FILTER ----------------------
 # Mirrors the indicator's "Day-of-Week Filter" group: when enabled, no

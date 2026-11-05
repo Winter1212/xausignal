@@ -1,5 +1,8 @@
 import os
 import json
+import math
+import calendar
+import numpy as np
 import requests
 import pandas as pd
 from flask import Flask, jsonify, request, Response
@@ -8,83 +11,72 @@ app = Flask(__name__)
 from ea_control import register_ea_control
 inject_ea_ui = register_ea_control(app)
 
-# =================================================================
-#  SYNCED WITH THE PINE INDICATOR ("Gold Signal Terminal")
-#  Changes in this revision:
-#   - Defaults now match the indicator settings you showed (RSI 80/40,
-#     Supertrend 8 / 2.0, pullback 1.2 ATR / 4 bars, extension 2.0 ATR,
-#     force-entry 09:00, SL = ATR x 1).
-#   - Supertrend is now the exact Pine ta.supertrend algorithm.
-#   - Entry signals are evaluated on the last CLOSED bar (the indicator
-#     acts at bar close), not on the still-forming candle.
-#   - HTF Supertrend uses the last COMPLETED higher-timeframe candle
-#     (the indicator's non-repainting request.security behaviour), for
-#     both live checks and the signal backtest.
-#   - Capital.com has no 2-hour candle, so "2h" is built by resampling
-#     1-hour candles (aligned to even UTC hours).
-#   - A signal can no longer open on the same bar where the previous
-#     trade just closed (same as the indicator).
-#   - Fixed: last_closed_bar_time was never initialised, so the closed-bar
-#     SL/TP backfill never actually ran.
+# =====================================================================
+#  SYNCED WITH "Gold Signal Terminal v2 — Trend + SMC + Flow Proxy"
+#  What changed vs the previous bot:
+#   - Defaults now equal the v2 indicator inputs (EMA 30/34, RSI 20,
+#     Supertrend 8/2.0, HTF 2h ATR 4 / factor 8, SL = ATR x1.5 clamped 8-20,
+#     RR 2.0 / 4.5, lock +5, spread 0.3, lot 0.05, trading end 23:59 ...).
+#   - Only TP1 / TP2 now (TP3/TP4 removed). Ratchet mode = lock SL at
+#     entry +/- LOCK_PTS after TP1, close the whole trade at TP2.
+#   - Full SMC engine ported: swing pivots, BOS, liquidity sweeps, FVG,
+#     order blocks, premium/discount, tick-volume delta proxy -> 0-5 score.
+#   - Trend entries are gated by the SMC score; standalone SMC sweep
+#     entries added; SMC trades use structure SL (beyond sweep wick).
+#   - Month-end pause, risk guard (max losses/day + cooldown bars).
+#   - Spread/cost deducted from every trade's points.
+#   - No exit on the entry bar; wins = pnl > 0.
+#   - HTF direction uses the PREVIOUS completed HTF candle ([1] in Pine).
+#   - Fixed: FORCE_REQUIRE_QUALITY_FILTERS was inverted (== "false").
 # =====================================================================
 
-# ---------------------- CONFG (env vars, set these in Render) ----------------------
-# Capital.com dem account access:
-#   1. Open a demo account: https://capital.com/
-#   2. Log in, enable Two-Factor Authentication (required before you can
-#      generate an API key).
-#   3. Settings -> API integrations -> Generate API key. Give it a Custom
-#      password (recommended, separate from your login password).
-#   4. Set the three env vars below from that step: CAPITAL_API_KEY (the
-#      generated key), CAPITAL_IDENTIFIER (your login/email), and
-#      CAPITAL_PASSWORD (the custom API password you set, or your account
-#      password if you didn't set a custom one).
+
+def _env_bool(name, default):
+    return os.environ.get(name, str(default)).strip().lower() == "true"
+
+
+def _env_int(name, default):
+    return int(os.environ.get(name, default))
+
+
+def _env_float(name, default):
+    return float(os.environ.get(name, default))
+
+
+# ---------------------- CONFIG (env vars, set these in Render) ----------------------
 CAPITAL_API_KEY    = os.environ.get("CAPITAL_API_KEY", "")
 CAPITAL_IDENTIFIER = os.environ.get("CAPITAL_IDENTIFIER", "")
 CAPITAL_PASSWORD   = os.environ.get("CAPITAL_PASSWORD", "")
-# Demo base URL by default -- switch to "https://api-capital.backend-capital.com"
-# only when/if you deliberately move to a funded live account.
-CAPITAL_BASE_URL = os.environ.get("CAPITAL_BASE_URL", "https://demo-api-capital.backend-capital.com")
+CAPITAL_BASE_URL   = os.environ.get("CAPITAL_BASE_URL", "https://demo-api-capital.backend-capital.com")
 
-TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID     = os.environ.get("TELEGRAM_CHAT_ID", "")
-# Capital.com identifies instruments by "epic" rather than a "XAU/USD"-style
-# ticker. Gold's epic is "GOLD" (verify with GET /api/v1/markets?searchTerm=gold
-# using your session tokens if this ever needs confirming for your account type).
-SYMBOL               = os.environ.get("SYMBOL", "GOLD")
-TIMEFRAME            = os.environ.get("TIMEFRAME", "5min")  # the entry chart timeframe, matches the indicator
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+SYMBOL             = os.environ.get("SYMBOL", "GOLD")
+TIMEFRAME          = os.environ.get("TIMEFRAME", "5min")
 
-# Default matches the indicator's "Force-Entry Timezone" / "Weekend-Check
-# Timezone" inputs ("Asia/Phnom_Penh", Cambodia, UTC+7). This drives the
-# Daily Trade Guarantee's day-boundary and FORCE_HOUR/FORCE_MINUTE check,
-# the weekend guard, the trading-hours guard and the day-of-week filter.
+# Used for the session filters, day filter, month-end pause AND the daily
+# guarantee (the indicator's "Session Timezone" and "Force-Entry Timezone"
+# are both Asia/Phnom_Penh by default).
 FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 
-# ---------------------- WEEKEND GUARD ----------------------
-DISABLE_WEEKEND_SIGNALS = os.environ.get("DISABLE_WEEKEND_SIGNALS", "true").lower() == "true"
+# ---------------------- SESSION FILTERS ----------------------
+DISABLE_WEEKEND_SIGNALS = _env_bool("DISABLE_WEEKEND_SIGNALS", True)
 
-# ---------------------- TRADING HOURS GUARD ----------------------
-USE_TRADING_HOURS   = os.environ.get("USE_TRADING_HOURS", "true").lower() == "true"
-TRADING_START_HOUR   = int(os.environ.get("TRADING_START_HOUR", 6))
-TRADING_START_MINUTE = int(os.environ.get("TRADING_START_MINUTE", 30))
-TRADING_END_HOUR     = int(os.environ.get("TRADING_END_HOUR", 22))
-TRADING_END_MINUTE   = int(os.environ.get("TRADING_END_MINUTE", 00))
+USE_TRADING_HOURS    = _env_bool("USE_TRADING_HOURS", True)
+TRADING_START_HOUR   = _env_int("TRADING_START_HOUR", 7)
+TRADING_START_MINUTE = _env_int("TRADING_START_MINUTE", 00)
+TRADING_END_HOUR     = _env_int("TRADING_END_HOUR", 22)
+TRADING_END_MINUTE   = _env_int("TRADING_END_MINUTE", 00)
 
-# ---------------------- DAY-OF-WEEK FILTER ----------------------
-# Mirrors the indicator's "Day-of-Week Filter" group: when enabled, no
-# trade of any kind (organic, pullback, or Forced Daily) is allowed to
-# open unless today (in FORCE_TIMEZONE) is one of the checked days.
-# Defaults match the indicator: Tue/Wed/Thu/Fri only.
-USE_DAY_FILTER = os.environ.get("USE_DAY_FILTER", "true").lower() == "true"
-TRADE_MON = os.environ.get("TRADE_MON", "false").lower() == "true"
-TRADE_TUE = os.environ.get("TRADE_TUE", "true").lower() == "true"
-TRADE_WED = os.environ.get("TRADE_WED", "true").lower() == "true"
-TRADE_THU = os.environ.get("TRADE_THU", "true").lower() == "true"
-TRADE_FRI = os.environ.get("TRADE_FRI", "true").lower() == "true"
-TRADE_SAT = os.environ.get("TRADE_SAT", "false").lower() == "true"
-TRADE_SUN = os.environ.get("TRADE_SUN", "false").lower() == "true"
+USE_DAY_FILTER = _env_bool("USE_DAY_FILTER", True)
+TRADE_MON = _env_bool("TRADE_MON", False)
+TRADE_TUE = _env_bool("TRADE_TUE", True)
+TRADE_WED = _env_bool("TRADE_WED", True)
+TRADE_THU = _env_bool("TRADE_THU", True)
+TRADE_FRI = _env_bool("TRADE_FRI", True)
+TRADE_SAT = _env_bool("TRADE_SAT", False)
+TRADE_SUN = _env_bool("TRADE_SUN", False)
 
-# datetime.weekday(): Monday=0 ... Sunday=6
 _DAY_FLAGS_BY_WEEKDAY = {
     0: TRADE_MON, 1: TRADE_TUE, 2: TRADE_WED, 3: TRADE_THU,
     4: TRADE_FRI, 5: TRADE_SAT, 6: TRADE_SUN,
@@ -95,92 +87,91 @@ _DAY_LABEL_FLAGS = [
     ("Sunday", TRADE_SUN),
 ]
 
-# ---------------------- SIGNAL ENGINE PARAMETERS ----------------------
-FAST_LEN = 30
-SLOW_LEN = 35
-USE_RSI = True
-RSI_LEN = 24
-RSI_OB = 80
-RSI_OS = 40
+USE_MONTH_END_PAUSE   = _env_bool("USE_MONTH_END_PAUSE", True)
+MONTH_END_PAUSE_DAYS  = _env_int("MONTH_END_PAUSE_DAYS", 3)
 
-# ---------------------- SUPERTREND TREND FILTER ----------------------
-ST_ATR_PERIOD = 12
-ST_FACTOR = 2.0
-ST_CONFIRM_BARS = int(os.environ.get("ST_CONFIRM_BARS", 1))
+# ---------------------- SIGNAL ENGINE ----------------------
+FAST_LEN = _env_int("FAST_LEN", 30)
+SLOW_LEN = _env_int("SLOW_LEN", 34)
+USE_RSI  = _env_bool("USE_RSI", True)
+RSI_LEN  = _env_int("RSI_LEN", 20)
+RSI_OB   = _env_int("RSI_OB", 80)
+RSI_OS   = _env_int("RSI_OS", 40)
 
-# ---------------------- HIGHER TIMEFRAME CONFIRMATION ----------------------
-USE_HTF = os.environ.get("USE_HTF", "true").lower() == "true"
-HTF_TIMEFRAME = os.environ.get("HTF_TIMEFRAME", "2h")
-HTF_ATR_PERIOD = int(os.environ.get("HTF_ATR_PERIOD", 8))
-HTF_FACTOR = float(os.environ.get("HTF_FACTOR", 4))
+ST_ATR_PERIOD   = _env_int("ST_ATR_PERIOD", 8)
+ST_FACTOR       = _env_float("ST_FACTOR", 2.0)
+ST_CONFIRM_BARS = _env_int("ST_CONFIRM_BARS", 1)
 
-# ---------------------- ENTRY TIMING: PULLBACK CONFIRMATION ----------------------
-USE_PULLBACK_ENTRY = os.environ.get("USE_PULLBACK_ENTRY", "true").lower() == "true"
-PULLBACK_MAX_ATR = float(os.environ.get("PULLBACK_MAX_ATR", 1.35))
-PULLBACK_TIMEOUT_BARS = int(os.environ.get("PULLBACK_TIMEOUT_BARS", 2))
+USE_HTF        = _env_bool("USE_HTF", True)
+HTF_TIMEFRAME  = os.environ.get("HTF_TIMEFRAME", "2h")
+HTF_ATR_PERIOD = _env_int("HTF_ATR_PERIOD", 4)
+HTF_FACTOR     = _env_float("HTF_FACTOR", 8)
 
-USE_EXTENSION_FILTER = os.environ.get("USE_EXTENSION_FILTER", "true").lower() == "true"
-MAX_EXTENSION_ATR = float(os.environ.get("MAX_EXTENSION_ATR", 2.0))
+# ---------------------- SMC ----------------------
+USE_SMC_GATE      = _env_bool("USE_SMC_GATE", True)
+GATE_MIN_SCORE    = _env_int("GATE_MIN_SCORE", 2)
+USE_SMC_TRIGGER   = _env_bool("USE_SMC_TRIGGER", True)
+TRIG_MIN_SCORE    = _env_int("TRIG_MIN_SCORE", 3)
+SWING_LEN         = _env_int("SWING_LEN", 5)
+SWEEP_LOOKBACK    = _env_int("SWEEP_LOOKBACK", 6)
+FVG_MIN_ATR       = _env_float("FVG_MIN_ATR", 0.3)
+ZONE_MAX_AGE      = _env_int("ZONE_MAX_AGE", 60)
+PD_LEN            = _env_int("PD_LEN", 60)
+USE_STRUCTURE_SL  = _env_bool("USE_STRUCTURE_SL", True)
+SL_BUFFER_PTS     = _env_float("SL_BUFFER_PTS", 1.0)
+
+USE_FLOW          = _env_bool("USE_FLOW", True)
+FLOW_LEN          = _env_int("FLOW_LEN", 10)
+REQUIRE_VOL_SPIKE = _env_bool("REQUIRE_VOL_SPIKE", False)
+VOL_MULT          = _env_float("VOL_MULT", 1.3)
+
+# ---------------------- ENTRY TIMING ----------------------
+USE_PULLBACK_ENTRY    = _env_bool("USE_PULLBACK_ENTRY", True)
+PULLBACK_MAX_ATR      = _env_float("PULLBACK_MAX_ATR", 1.2)
+PULLBACK_TIMEOUT_BARS = _env_int("PULLBACK_TIMEOUT_BARS", 4)
+USE_EXTENSION_FILTER  = _env_bool("USE_EXTENSION_FILTER", True)
+MAX_EXTENSION_ATR     = _env_float("MAX_EXTENSION_ATR", 2.5)
 
 # ---------------------- DAILY TRADE GUARANTEE ----------------------
-GUARANTEE_DAILY_TRADE = os.environ.get("GUARANTEE_DAILY_TRADE", "true").lower() == "true"
-FORCE_HOUR   = int(os.environ.get("FORCE_HOUR", 9))
-FORCE_MINUTE = int(os.environ.get("FORCE_MINUTE", 0))
-
-FORCE_REQUIRE_QUALITY_FILTERS = os.environ.get("FORCE_REQUIRE_QUALITY_FILTERS", "true").lower() == "false"
-
-FORCE_HARD_HOUR   = int(os.environ.get("FORCE_HARD_HOUR", 23))
-FORCE_HARD_MINUTE = int(os.environ.get("FORCE_HARD_MINUTE", 45))
-
-FORCE_SKIP_IF_NEVER_VALID = os.environ.get("FORCE_SKIP_IF_NEVER_VALID", "false").lower() == "true"
+GUARANTEE_DAILY_TRADE = _env_bool("GUARANTEE_DAILY_TRADE", True)
+FORCE_HOUR   = _env_int("FORCE_HOUR", 9)
+FORCE_MINUTE = _env_int("FORCE_MINUTE", 0)
+FORCE_REQUIRE_QUALITY_FILTERS = _env_bool("FORCE_REQUIRE_QUALITY_FILTERS", True)
+FORCE_HARD_HOUR   = _env_int("FORCE_HARD_HOUR", 23)
+FORCE_HARD_MINUTE = _env_int("FORCE_HARD_MINUTE", 45)
+FORCE_SKIP_IF_NEVER_VALID = _env_bool("FORCE_SKIP_IF_NEVER_VALID", False)
 
 # ---------------------- RISK MANAGEMENT ----------------------
-ATR_LEN = 20
-SL_MULT = 1.0
-SL_MIN_PTS = 10.0
-SL_MAX_PTS = 10.0
-RR1, RR2, RR3, RR4 = 2.0, 4.8, 5.8, 6.5
+ATR_LEN    = _env_int("ATR_LEN", 20)
+SL_MULT    = _env_float("SL_MULT", 1.5)
+SL_MIN_PTS = _env_float("SL_MIN_PTS", 10)
+SL_MAX_PTS = _env_float("SL_MAX_PTS", 10)
+RR1 = _env_float("RR1", 2.0)
+RR2 = _env_float("RR2", 4.5)
+LOCK_PTS   = _env_float("LOCK_PTS", 5.0)
+SPREAD_PTS = _env_float("SPREAD_PTS", 0.0)
 
-# When TP1 is hit, the SL no longer jumps to pure breakeven. It moves to
-# entry +/- LOCK_PTS (in the trade's favor) instead, so a reversal after
-# TP1 still books LOCK_PTS of profit rather than scratching at $0.
-# Mirrors the Pine indicator's "SL Lock After TP1 (points beyond entry)"
-# input (default 5). Set to 0.0 to restore the old pure-breakeven behavior.
-# TP2 -> SL at TP1, TP3 -> SL at TP2 (same as the indicator).
-LOCK_PTS = float(os.environ.get("LOCK_PTS", 9.0))
+# "ratchet"   = lock SL after TP1, close whole trade at TP2   (indicator default)
+# "tp1_only"  = full size closes at TP1
+# "first_hit" = full size closes at whichever TP is hit first
+PNL_MODE = os.environ.get("tp1_only", "ratchet")
 
-PNL_MODE = os.environ.get("PNL_MODE", "tp1_only")
+MAX_LOSSES_PER_DAY = _env_int("MAX_LOSSES_PER_DAY", 2)   # 0 = unlimited
+COOLDOWN_BARS      = _env_int("COOLDOWN_BARS", 6)
 
-USE_TRAILING_RUNNER = False
-
-LOT_SIZE = float(os.environ.get("LOT_SIZE", 0.1))
-UNITS_PER_LOT = float(os.environ.get("UNITS_PER_LOT", 100))
+LOT_SIZE      = _env_float("LOT_SIZE", 0.1)
+UNITS_PER_LOT = _env_float("UNITS_PER_LOT", 100)
 
 STATE_FILE = "state.json"
 
-
 # ---------------------- CAPITAL.COM DATA FETCHING ----------------------
-# Capital.com's resolution codes don't match Twelve Data's interval strings,
-# so we translate. Keep using the same TIMEFRAME / HTF_TIMEFRAME env values
-# you already had ("5min", "2h", "4h", etc.) -- only this map needs to know
-# about Capital.com's naming.
 _CAPITAL_RESOLUTION_MAP = {
     "1min": "MINUTE", "5min": "MINUTE_5", "15min": "MINUTE_15", "30min": "MINUTE_30",
-    "45min": "MINUTE_30",  # no 45-minute resolution; falls back if ever used
+    "45min": "MINUTE_30",
     "1h": "HOUR", "4h": "HOUR_4",
     "1day": "DAY", "1week": "WEEK",
 }
-
-# Capital.com has no native 2-hour candle. For these intervals we fetch the
-# base interval and resample it: {interval: (base_interval, hours_per_bar)}.
-_RESAMPLE_FROM = {
-    "2h": ("1h", 2),
-}
-
-# Duration of one candle per interval, in minutes. Used to figure out how
-# far a single <=1000-candle Capital.com request can reach, so multi-chunk
-# pagination (see fetch_candles_range) knows how wide to make each chunk,
-# and to line the higher-timeframe series up without look-ahead.
+_RESAMPLE_FROM = {"2h": ("1h", 2)}
 _INTERVAL_MINUTES = {
     "1min": 1, "5min": 5, "15min": 15, "30min": 30, "45min": 30,
     "1h": 60, "2h": 120, "4h": 240, "1day": 1440, "1week": 10080,
@@ -192,20 +183,10 @@ def _capital_resolution(interval):
 
 
 def _capital_session_headers():
-    """
-    Capital.com auth is session-based rather than a single static token:
-    you exchange your API key + login + password for two short-lived
-    tokens (CST and X-SECURITY-TOKEN) via POST /session, then send both on
-    every subsequent request. Sessions expire after ~10 minutes of
-    inactivity, so -- same pattern as the old FXCM connection helper --
-    we just open a fresh session on every call rather than trying to
-    cache/reuse one across stateless Flask requests.
-    """
     if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
         raise RuntimeError(
             "Missing Capital.com credentials. Set CAPITAL_API_KEY, "
-            "CAPITAL_IDENTIFIER (your login/email), and CAPITAL_PASSWORD "
-            "(the custom API password you set when generating the key)."
+            "CAPITAL_IDENTIFIER (your login/email), and CAPITAL_PASSWORD."
         )
     url = f"{CAPITAL_BASE_URL}/api/v1/session"
     headers = {"X-CAP-API-KEY": CAPITAL_API_KEY, "Content-Type": "application/json"}
@@ -213,7 +194,6 @@ def _capital_session_headers():
     r = requests.post(url, headers=headers, json=body, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"Capital.com session error ({r.status_code}): {r.text}")
-
     cst = r.headers.get("CST")
     security_token = r.headers.get("X-SECURITY-TOKEN")
     if not cst or not security_token:
@@ -222,8 +202,6 @@ def _capital_session_headers():
 
 
 def _local_naive_to_utc_naive(dt_local):
-    """Convert a naive datetime expressed in FORCE_TIMEZONE to a naive UTC
-    datetime, since Capital.com's from/to params are UTC."""
     ts = pd.Timestamp(dt_local)
     if ts.tzinfo is None:
         ts = ts.tz_localize(FORCE_TIMEZONE)
@@ -231,45 +209,26 @@ def _local_naive_to_utc_naive(dt_local):
 
 
 def _capital_prices_to_df(payload):
-    """Capital.com returns a 'prices' list of bid/ask OHLC candles with a
-    snapshotTimeUTC field. Convert to the same shape the rest of this file
-    expects: a 'datetime' column (naive, in FORCE_TIMEZONE) plus
-    open/high/low/close (bid prices)."""
     prices = payload.get("prices", [])
     if not prices:
         raise RuntimeError("Capital.com returned no candles for this request.")
-
     rows = []
     for p in prices:
         o, c, h, l = p["openPrice"], p["closePrice"], p["highPrice"], p["lowPrice"]
         rows.append({
             "datetime": p["snapshotTimeUTC"],
-            "open": o["bid"],
-            "high": h["bid"],
-            "low": l["bid"],
-            "close": c["bid"],
+            "open": o["bid"], "high": h["bid"], "low": l["bid"], "close": c["bid"],
+            "volume": p.get("lastTradedVolume", 0) or 0,
         })
-
     df = pd.DataFrame(rows)
     df["datetime"] = (
-        pd.to_datetime(df["datetime"])
-        .dt.tz_localize("UTC")
-        .dt.tz_convert(FORCE_TIMEZONE)
-        .dt.tz_localize(None)
+        pd.to_datetime(df["datetime"]).dt.tz_localize("UTC")
+        .dt.tz_convert(FORCE_TIMEZONE).dt.tz_localize(None)
     )
-    df = df.sort_values("datetime").reset_index(drop=True)
-    return df
+    return df.sort_values("datetime").reset_index(drop=True)
 
 
 def _resample_candles(df, hours):
-    """
-    Build N-hour candles out of 1-hour candles (Capital.com has no 2h
-    resolution). Buckets are aligned to UTC midnight, i.e. even UTC hours
-    for 2h bars -- the closest stand-in for TradingView's 2h chart. The
-    'datetime' column is naive FORCE_TIMEZONE, like every other frame here,
-    so we round-trip through UTC to keep the alignment independent of the
-    display timezone.
-    """
     tmp = df.copy()
     tmp["utc"] = (
         tmp["datetime"]
@@ -277,23 +236,18 @@ def _resample_candles(df, hours):
         .dt.tz_convert("UTC")
     )
     tmp = tmp.dropna(subset=["utc"]).set_index("utc")
-
     rule = f"{hours}h"
     agg = tmp.resample(rule, origin="start_day").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last"}
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     )
     counts = tmp["close"].resample(rule, origin="start_day").count()
     agg = agg[counts > 0].dropna()
     counts = counts[counts > 0]
-
-    # the very first bucket is usually cut in half by where the fetch
-    # window starts -- drop it rather than feed a partial candle in.
     if len(agg) > 1 and counts.iloc[0] < hours:
         agg = agg.iloc[1:]
-
     agg.index = agg.index.tz_convert(FORCE_TIMEZONE).tz_localize(None)
     agg.index.name = "datetime"
-    return agg.reset_index()[["datetime", "open", "high", "low", "close"]]
+    return agg.reset_index()[["datetime", "open", "high", "low", "close", "volume"]]
 
 
 def fetch_candles(interval, outputsize=500):
@@ -301,7 +255,6 @@ def fetch_candles(interval, outputsize=500):
         base_interval, factor = _RESAMPLE_FROM[interval]
         base_df = fetch_candles(base_interval, outputsize=min(outputsize * factor, 1000))
         return _resample_candles(base_df, factor)
-
     headers = _capital_session_headers()
     params = {"resolution": _capital_resolution(interval), "max": min(outputsize, 1000)}
     r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=15)
@@ -311,33 +264,8 @@ def fetch_candles(interval, outputsize=500):
 
 
 def fetch_candles_range(interval, start_date, end_date, session_headers=None):
-    """
-    Same shape/contract as before -- pulls an explicit date range instead of
-    a fixed outputsize, used by the signal-history walk-back. start_date/end_date
-    are naive datetimes in FORCE_TIMEZONE (as produced by run_signal_backtest());
-    we convert them to UTC before calling Capital.com.
-
-    PAGINATION: Capital.com caps a single response at max=1000 candles, but
-    it ALSO enforces its own (undocumented, resolution-dependent) cap on how
-    wide a single from/to window can be -- independent of how many candles
-    that window implies. A HOUR_4 or DAY window sized purely off the
-    1000-candle math (e.g. ~167 days for HOUR_4) can still be rejected with
-    "error.invalid.max.daterange" even though it's well under the 1000-candle
-    limit. Rather than hardcoding a "safe" chunk width per resolution (which
-    breaks the moment Capital.com's real limit differs from our guess), we
-    start from the candle-count-based chunk width as an upper bound and, if a
-    chunk is rejected specifically with error.invalid.max.daterange, halve
-    that chunk's width and retry -- continuing to halve until Capital.com
-    accepts it. The working width is then reused (but never grown back past
-    the 1000-candle ceiling) for subsequent chunks, so we don't rediscover
-    the limit from scratch every time.
-
-    Pass session_headers to reuse one already-open Capital.com session
-    across every chunk (and, e.g., across a paired entry-timeframe +
-    higher-timeframe fetch) instead of logging in fresh per chunk --
-    important once a fetch needs more than one or two chunks. If omitted,
-    a session is opened here and used for the whole call.
-    """
+    """Paginated range fetch (see earlier revisions): halves the window when
+    Capital.com answers error.invalid.max.daterange."""
     if interval in _RESAMPLE_FROM:
         base_interval, factor = _RESAMPLE_FROM[interval]
         base_df = fetch_candles_range(
@@ -348,7 +276,6 @@ def fetch_candles_range(interval, start_date, end_date, session_headers=None):
 
     own_session = session_headers is None
     headers = session_headers or _capital_session_headers()
-
     resolution = _capital_resolution(interval)
     interval_minutes = _INTERVAL_MINUTES.get(interval, 5)
     max_chunk_span = pd.Timedelta(minutes=interval_minutes * 1000)
@@ -362,29 +289,17 @@ def fetch_candles_range(interval, start_date, end_date, session_headers=None):
 
     while cur_start < end_utc:
         cur_end = min(cur_start + chunk_span, end_utc)
-
         while True:
             params = {
-                "resolution": resolution,
-                "max": 1000,
+                "resolution": resolution, "max": 1000,
                 "from": cur_start.strftime("%Y-%m-%dT%H:%M:%S"),
                 "to": cur_end.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
-
             if r.status_code in (401, 403) and own_session:
-                # session most likely expired mid-pagination (a wide range can
-                # take longer than the ~10min session lifetime) -- log in
-                # again once and retry this one chunk before giving up.
                 headers = _capital_session_headers()
                 r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=30)
-
             if r.status_code == 400 and "error.invalid.max.daterange" in r.text:
-                # This window is too wide for this resolution's (undocumented)
-                # per-request date-range cap -- halve it and try the same
-                # chunk again. Bail out only if it's been shrunk down to
-                # something absurd (a single candle's worth), which would
-                # indicate a different, unrelated problem.
                 new_span = (cur_end - cur_start) / 2
                 if new_span < pd.Timedelta(minutes=interval_minutes):
                     raise RuntimeError(
@@ -392,32 +307,24 @@ def fetch_candles_range(interval, start_date, end_date, session_headers=None):
                         f"(still rejected after shrinking the window down to {new_span})"
                     )
                 cur_end = cur_start + new_span
-                chunk_span = new_span  # remember the working size for subsequent chunks too
+                chunk_span = new_span
                 continue
-
             if r.status_code != 200:
                 raise RuntimeError(f"Capital.com prices range error ({r.status_code}): {r.text}")
-
-            break  # this chunk succeeded
+            break
 
         payload = r.json()
         if payload.get("prices"):
             frames.append(_capital_prices_to_df(payload))
         cur_start = cur_end
-        # never let a previously-shrunk chunk_span grow back past the
-        # 1000-candle ceiling for later chunks
         chunk_span = min(chunk_span, max_chunk_span)
 
     if not frames:
         raise RuntimeError("Capital.com returned no candles for this request.")
-
-    df = (
+    return (
         pd.concat(frames, ignore_index=True)
-        .drop_duplicates(subset="datetime")
-        .sort_values("datetime")
-        .reset_index(drop=True)
+        .drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
     )
-    return df
 
 
 # ---------------------- INDICATORS ----------------------
@@ -439,9 +346,7 @@ def true_range(df):
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     return pd.concat([
-        (high - low).abs(),
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
+        (high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs(),
     ], axis=1).max(axis=1)
 
 
@@ -450,12 +355,8 @@ def atr(df, length):
 
 
 def supertrend(df, period, factor):
-    """
-    Same algorithm as Pine's ta.supertrend (the band-clamping rules and the
-    flip test against the CURRENT final band). direction: 1 = bullish
-    (line under price), -1 = bearish. Pine itself starts on the first bar
-    in the bearish state, so we do too.
-    """
+    """Pine ta.supertrend. direction here: 1 = bullish, -1 = bearish
+    (Pine's own sign is the opposite: <0 bullish)."""
     hl2 = ((df["high"] + df["low"]) / 2).tolist()
     close = df["close"].tolist()
     atr_val = true_range(df).ewm(alpha=1 / period, adjust=False).mean().tolist()
@@ -469,7 +370,6 @@ def supertrend(df, period, factor):
     for i in range(n):
         upper = hl2[i] + factor * atr_val[i]
         lower = hl2[i] - factor * atr_val[i]
-
         if i == 0:
             final_upper[i] = upper
             final_lower[i] = lower
@@ -479,14 +379,10 @@ def supertrend(df, period, factor):
             prev_lower = final_lower[i - 1]
             final_lower[i] = lower if (lower > prev_lower or close[i - 1] < prev_lower) else prev_lower
             final_upper[i] = upper if (upper < prev_upper or close[i - 1] > prev_upper) else prev_upper
-
             if direction[i - 1] == -1:
-                # was riding the upper band -> flips bullish once close clears it
                 direction[i] = 1 if close[i] > final_upper[i] else -1
             else:
-                # was riding the lower band -> flips bearish once close breaks it
                 direction[i] = -1 if close[i] < final_lower[i] else 1
-
         st[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
 
     return (
@@ -495,24 +391,49 @@ def supertrend(df, period, factor):
     )
 
 
-def bars_since_supertrend_flip(dir_series):
-    n = len(dir_series)
-    if n == 0:
-        return 9999
-    last_dir = dir_series.iloc[-1]
-    count = 0
-    for i in range(n - 1, -1, -1):
-        if dir_series.iloc[i] == last_dir:
-            count += 1
-        else:
-            break
-    return count - 1
+def add_indicators(df):
+    df["emaFast"] = ema(df["close"], FAST_LEN)
+    df["emaSlow"] = ema(df["close"], SLOW_LEN)
+    df["rsi"] = rsi(df["close"], RSI_LEN)
+    df["atr"] = atr(df, ATR_LEN)
+    st_series, dir_series = supertrend(df, ST_ATR_PERIOD, ST_FACTOR)
+    df["st"] = st_series
+    df["st_dir"] = dir_series
+
+    # bars since the last Supertrend flip (Pine: bar_index - stFlipBar)
+    d = df["st_dir"].tolist()
+    out, last_flip = [], None
+    for i, x in enumerate(d):
+        if i > 0 and x != d[i - 1]:
+            last_flip = i
+        out.append(9999 if last_flip is None else i - last_flip)
+    df["bars_since_flip"] = out
+    return df
+
+
+def attach_htf_direction(df, htf_df):
+    """
+    Pine: request.security(htf, supertrend()[1], lookahead_on) -> while a chart
+    bar sits inside HTF candle H it sees the supertrend of candle H-1 (the
+    previous COMPLETED HTF candle). Shifting each HTF timestamp (candle open)
+    by one full HTF candle and doing a backward as-of merge reproduces that.
+    Used by BOTH the live check and the backtest.
+    """
+    _, d = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
+    h = htf_df[["datetime"]].copy()
+    h["htf_st_dir"] = d.values
+    h["datetime"] = h["datetime"] + pd.Timedelta(minutes=_INTERVAL_MINUTES.get(HTF_TIMEFRAME, 120))
+    out = pd.merge_asof(df.sort_values("datetime"), h.sort_values("datetime"),
+                        on="datetime", direction="backward")
+    out["htf_st_dir"] = out["htf_st_dir"].fillna(0).astype(int)
+    return out.reset_index(drop=True)
 
 
 def trend_arrow(d):
     return "▲" if d == 1 else "▼" if d == -1 else "→"
 
 
+# ---------------------- SESSION / DAY / MONTH FILTERS ----------------------
 def is_weekend_bar(bar_dt):
     return bar_dt.weekday() >= 5
 
@@ -532,42 +453,181 @@ def is_day_blocked(bar_dt):
     return not _DAY_FLAGS_BY_WEEKDAY.get(bar_dt.weekday(), False)
 
 
+def is_month_end_blocked(bar_dt):
+    if not USE_MONTH_END_PAUSE:
+        return False
+    dim = calendar.monthrange(bar_dt.year, bar_dt.month)[1]
+    return bar_dt.day > (dim - MONTH_END_PAUSE_DAYS)
+
+
 def is_new_entries_blocked(bar_dt):
     weekend = DISABLE_WEEKEND_SIGNALS and is_weekend_bar(bar_dt)
     outside_hours = is_outside_trading_hours(bar_dt)
     day_blocked = is_day_blocked(bar_dt)
-    return weekend, outside_hours, day_blocked, (weekend or outside_hours or day_blocked)
+    month_blocked = is_month_end_blocked(bar_dt)
+    return weekend, outside_hours, day_blocked, month_blocked, (weekend or outside_hours or day_blocked or month_blocked)
 
 
-def htf_direction_from_series(htf_dir_series):
+# ---------------------- SMC ENGINE (port of the Pine SMC block) ----------------------
+def _ok(x):
+    return x == x  # not NaN
+
+
+class SMCEngine:
     """
-    Direction of the last COMPLETED higher-timeframe candle. The newest HTF
-    candle from Capital.com is still forming; the indicator's
-    request.security(..., lookahead_off) doesn't repaint on a candle that
-    hasn't closed, so neither do we.
+    Bar-by-bar port of the indicator's SMC section. Call step(i) for every bar
+    in order. After an entry fires call reset_sweeps() (Pine sets
+    lastSweepLowBar/lastSweepHighBar := na when a trade opens).
     """
-    if len(htf_dir_series) > 1:
-        return int(htf_dir_series.iloc[-2])
-    return int(htf_dir_series.iloc[-1])
+
+    def __init__(self, df):
+        n = len(df)
+        self.n = n
+        self.o = df["open"].to_numpy(dtype=float)
+        self.h = df["high"].to_numpy(dtype=float)
+        self.l = df["low"].to_numpy(dtype=float)
+        self.c = df["close"].to_numpy(dtype=float)
+        self.atr = df["atr"].to_numpy(dtype=float)
+        vol = df["volume"].to_numpy(dtype=float) if "volume" in df.columns else np.zeros(n)
+
+        rng = self.h - self.l
+        with np.errstate(divide="ignore", invalid="ignore"):
+            buy = np.where(rng > 0, vol * (self.c - self.l) / rng, vol * 0.5)
+        delta = buy - (vol - buy)
+        self.flow_avg = pd.Series(delta).rolling(FLOW_LEN).mean().to_numpy()
+        self.vol_spike = vol > (pd.Series(vol).rolling(20).mean().to_numpy() * VOL_MULT)
+        self.range_hi = pd.Series(self.h).rolling(PD_LEN).max().to_numpy()
+        self.range_lo = pd.Series(self.l).rolling(PD_LEN).min().to_numpy()
+
+        nan = math.nan
+        self.sw_h = nan; self.sw_l = nan
+        self.sw_h_used = False; self.sw_l_used = False
+        self.struct_dir = 0
+        self.last_sweep_low_bar = None; self.last_sweep_high_bar = None
+        self.sweep_low_px = nan; self.sweep_high_px = nan
+        self.b_top = nan; self.b_bot = nan; self.b_bar = -1
+        self.s_top = nan; self.s_bot = nan; self.s_bar = -1
+        self.last_bear_hi = nan; self.last_bear_lo = nan
+        self.last_bull_hi = nan; self.last_bull_lo = nan
+        self.bull_top = nan; self.bull_bot = nan; self.bull_bar = -1
+        self.bear_top = nan; self.bear_bot = nan; self.bear_bar = -1
+
+    def reset_sweeps(self):
+        self.last_sweep_low_bar = None
+        self.last_sweep_high_bar = None
+
+    def step(self, i):
+        o, h, l, c = self.o, self.h, self.l, self.c
+        L = SWING_LEN
+        nan = math.nan
+
+        # swing pivots (confirmed L bars later)
+        if i >= 2 * L:
+            ci = i - L
+            if h[ci] == h[i - 2 * L:i + 1].max():
+                self.sw_h = h[ci]; self.sw_h_used = False
+            if l[ci] == l[i - 2 * L:i + 1].min():
+                self.sw_l = l[ci]; self.sw_l_used = False
+
+        # BOS
+        bos_up = _ok(self.sw_h) and (not self.sw_h_used) and c[i] > self.sw_h
+        bos_dn = _ok(self.sw_l) and (not self.sw_l_used) and c[i] < self.sw_l
+        if bos_up:
+            self.struct_dir = 1; self.sw_h_used = True
+        if bos_dn:
+            self.struct_dir = -1; self.sw_l_used = True
+
+        # liquidity sweeps
+        sweep_low = _ok(self.sw_l) and l[i] < self.sw_l and c[i] > self.sw_l
+        sweep_high = _ok(self.sw_h) and h[i] > self.sw_h and c[i] < self.sw_h
+        if sweep_low:
+            self.last_sweep_low_bar = i; self.sweep_low_px = l[i]
+        if sweep_high:
+            self.last_sweep_high_bar = i; self.sweep_high_px = h[i]
+        recent_low = self.last_sweep_low_bar is not None and (i - self.last_sweep_low_bar) <= SWEEP_LOOKBACK
+        recent_high = self.last_sweep_high_bar is not None and (i - self.last_sweep_high_bar) <= SWEEP_LOOKBACK
+
+        # fair value gaps
+        a = self.atr[i]
+        if i >= 2:
+            if l[i] > h[i - 2] and (l[i] - h[i - 2]) >= FVG_MIN_ATR * a and c[i - 1] > o[i - 1]:
+                self.b_top, self.b_bot, self.b_bar = l[i], h[i - 2], i
+            if h[i] < l[i - 2] and (l[i - 2] - h[i]) >= FVG_MIN_ATR * a and c[i - 1] < o[i - 1]:
+                self.s_top, self.s_bot, self.s_bar = l[i - 2], h[i], i
+        if _ok(self.b_bot) and (c[i] < self.b_bot or i - self.b_bar > ZONE_MAX_AGE):
+            self.b_top = nan; self.b_bot = nan
+        if _ok(self.s_top) and (c[i] > self.s_top or i - self.s_bar > ZONE_MAX_AGE):
+            self.s_top = nan; self.s_bot = nan
+
+        # order blocks (last opposite candle before a BOS)
+        if bos_up and _ok(self.last_bear_lo):
+            self.bull_top, self.bull_bot, self.bull_bar = self.last_bear_hi, self.last_bear_lo, i
+        if bos_dn and _ok(self.last_bull_lo):
+            self.bear_top, self.bear_bot, self.bear_bar = self.last_bull_hi, self.last_bull_lo, i
+        if c[i] < o[i]:
+            self.last_bear_hi, self.last_bear_lo = h[i], l[i]
+        if c[i] > o[i]:
+            self.last_bull_hi, self.last_bull_lo = h[i], l[i]
+        if _ok(self.bull_bot) and (c[i] < self.bull_bot or i - self.bull_bar > ZONE_MAX_AGE):
+            self.bull_top = nan; self.bull_bot = nan
+        if _ok(self.bear_top) and (c[i] > self.bear_top or i - self.bear_bar > ZONE_MAX_AGE):
+            self.bear_top = nan; self.bear_bot = nan
+
+        in_bull_fvg = _ok(self.b_top) and i > self.b_bar and l[i] <= self.b_top and c[i] >= self.b_bot
+        in_bear_fvg = _ok(self.s_bot) and i > self.s_bar and h[i] >= self.s_bot and c[i] <= self.s_top
+        in_bull_ob = _ok(self.bull_top) and i > self.bull_bar and l[i] <= self.bull_top and c[i] >= self.bull_bot
+        in_bear_ob = _ok(self.bear_bot) and i > self.bear_bar and h[i] >= self.bear_bot and c[i] <= self.bear_top
+        in_bull_zone = in_bull_fvg or in_bull_ob
+        in_bear_zone = in_bear_fvg or in_bear_ob
+
+        # premium / discount
+        eq = (self.range_hi[i] + self.range_lo[i]) / 2
+        in_discount = bool(c[i] < eq)
+        in_premium = bool(c[i] > eq)
+
+        # delta proxy
+        fa = self.flow_avg[i]
+        flow_bull = USE_FLOW and bool(fa > 0)
+        flow_bear = USE_FLOW and bool(fa < 0)
+
+        score_long = int(self.struct_dir == 1) + int(recent_low) + int(in_bull_zone) + int(in_discount) + int(flow_bull)
+        score_short = int(self.struct_dir == -1) + int(recent_high) + int(in_bear_zone) + int(in_premium) + int(flow_bear)
+
+        return {
+            "score_long": score_long, "score_short": score_short,
+            "recent_sweep_low": recent_low, "recent_sweep_high": recent_high,
+            "sweep_low_px": self.sweep_low_px, "sweep_high_px": self.sweep_high_px,
+            "vol_spike": bool(self.vol_spike[i]), "struct_dir": self.struct_dir,
+        }
 
 
 # ---------------------- STATE ----------------------
+DEFAULT_STATS = {
+    "total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
+    "best_trade": None, "worst_trade": None,
+    "trend_n": 0, "trend_w": 0, "smc_n": 0, "smc_w": 0, "forced_n": 0, "forced_w": 0,
+}
+
 DEFAULT_STATE = {
     "last_signal_bar": None,
     "last_closed_bar_time": None,
     "position": None,
     "history": [],
-    "stats": {
-        "total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
-        "best_trade": None, "worst_trade": None,
-    },
+    "stats": dict(DEFAULT_STATS),
     "current_day": None,
     "traded_today": False,
     "force_attempted_today": False,
     "force_skipped_today": False,
+    "losses_today": 0,
+    "last_exit_bar_time": None,
+    "smc_reset_times": [],
     "pending_dir": None,
     "pending_bar_time": None,
 }
+
+
+def fresh_state():
+    return json.loads(json.dumps(DEFAULT_STATE))
 
 
 def load_state():
@@ -575,9 +635,11 @@ def load_state():
         with open(STATE_FILE) as f:
             state = json.load(f)
         for k, v in DEFAULT_STATE.items():
-            state.setdefault(k, v)
+            state.setdefault(k, json.loads(json.dumps(v)))
+        for k, v in DEFAULT_STATS.items():
+            state["stats"].setdefault(k, v)
         return state
-    return json.loads(json.dumps(DEFAULT_STATE))
+    return fresh_state()
 
 
 def save_state(state):
@@ -595,8 +657,7 @@ def send_telegram(text):
 
 
 def _notify_requested():
-    val = request.args.get("notify", "").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    return request.args.get("notify", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _fmt_price(v):
@@ -611,18 +672,19 @@ def _fmt_money(v):
 
 def build_check_telegram_message(result, state):
     lines = ["📊 [Manual Check] XAUUSD", f"Bar: {result.get('bar_time')} ({FORCE_TIMEZONE})"]
-
     event = result.get("event")
     if event == "entry":
-        lines.append(f"Result: NEW {result.get('side')} signal opened this check {'(Forced Daily)' if result.get('forced') else '(Supertrend)'}.")
+        lines.append(f"Result: NEW {result.get('side')} signal opened this check ({result.get('setup')}).")
     elif event == "position_update":
-        lines.append("Result: open position was updated this check (TP/SL/trail — see the alert above).")
+        lines.append("Result: open position was updated this check (TP/SL — see the alert above).")
     elif result.get("weekend_skipped"):
         lines.append("Result: weekend — new-signal checks skipped (existing position, if any, still managed).")
     elif result.get("trading_hours_skipped"):
         lines.append("Result: outside trading hours — new-signal checks skipped (existing position, if any, still managed).")
     elif result.get("day_skipped"):
-        lines.append("Result: today isn't a selected trading day — new-signal checks skipped (existing position, if any, still managed).")
+        lines.append("Result: today isn't a selected trading day — new-signal checks skipped.")
+    elif result.get("month_skipped"):
+        lines.append("Result: month-end pause active — new-signal checks skipped.")
     else:
         pending = state.get("pending_dir")
         if pending:
@@ -634,15 +696,11 @@ def build_check_telegram_message(result, state):
     if pos:
         side = "BUY" if pos["dir"] == 1 else "SELL"
         lines.append(
-            f"Open position: {side} @ {_fmt_price(pos['entry'])} | "
-            f"SL {_fmt_price(pos['sl'])} | TP1 {_fmt_price(pos['tp1'])} "
-            f"TP2 {_fmt_price(pos['tp2'])} TP3 {_fmt_price(pos['tp3'])} "
-            f"TP4 {_fmt_price(pos['tp4'])} | "
-            f"remaining {round(pos['remaining_size'] * 100)}%"
+            f"Open position: {side} ({pos.get('setup', '')}) @ {_fmt_price(pos['entry'])} | "
+            f"SL {_fmt_price(pos['sl'])} | TP1 {_fmt_price(pos['tp1'])} TP2 {_fmt_price(pos['tp2'])}"
         )
     else:
         lines.append("No open position.")
-
     return "\n".join(lines)
 
 
@@ -653,324 +711,169 @@ def build_stats_telegram_message(payload, state):
         f"Net P&L: {_fmt_money(payload['net_pnl'])}",
         f"Best trade: {_fmt_money(payload['best_trade'])} | Worst trade: {_fmt_money(payload['worst_trade'])}",
     ]
-
+    ss = payload.get("setup_stats", {})
+    lines.append(
+        f"Trend {ss.get('trend_w', 0)}/{ss.get('trend_n', 0)} | SMC {ss.get('smc_w', 0)}/{ss.get('smc_n', 0)} | "
+        f"Forced {ss.get('forced_w', 0)}/{ss.get('forced_n', 0)}"
+    )
     pos = payload.get("position")
     if pos:
         side = "BUY" if pos["dir"] == 1 else "SELL"
-        lines.append(
-            f"Open position: {side} @ {_fmt_price(pos['entry'])} | SL {_fmt_price(pos['sl'])}"
-        )
+        lines.append(f"Open position: {side} @ {_fmt_price(pos['entry'])} | SL {_fmt_price(pos['sl'])}")
     else:
         lines.append("No open position.")
-
     dg = payload["daily_guarantee"]
     lines.append(
         f"Daily guarantee: {'ON' if dg['enabled'] else 'OFF'} @ "
         f"{dg['force_hour']:02d}:{dg['force_minute']:02d} {dg['force_timezone']} | "
         f"traded today: {'yes' if dg['traded_today'] else 'no'}"
     )
-
+    rg = payload.get("risk_guard", {})
+    lines.append(f"Losses today: {rg.get('losses_today', 0)} / {rg.get('max_losses_per_day') or '∞'}")
     th = payload.get("trading_hours", {})
     if th.get("enabled"):
         lines.append(
             f"Trading hours: {th['start_hour']:02d}:{th['start_minute']:02d}"
             f"-{th['end_hour']:02d}:{th['end_minute']:02d} {th['timezone']}"
         )
-
     dayf = payload.get("day_filter", {})
     if dayf.get("enabled"):
-        selected = ", ".join(dayf.get("selected_days", [])) or "none"
-        lines.append(f"Day filter: {selected}")
-
+        lines.append(f"Day filter: {', '.join(dayf.get('selected_days', [])) or 'none'}")
     return "\n".join(lines)
 
 
-# ---------------------- TRADE LOG ----------------------
-def log_trade(state, side, entry, sl, tp1, tp2, tp3, tp4, exit_price, result, points, pnl):
+# ---------------------- TRADE LOG / SETTLEMENT ----------------------
+def settle_trade(state, pos, exit_price, result_label, bar_time):
+    """Mirror of Pine closeTrade(): spread is deducted from the points."""
+    raw = (exit_price - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - exit_price)
+    points = raw - SPREAD_PTS
+    pnl = points * LOT_SIZE * UNITS_PER_LOT
+    setup = pos.get("setup", "TREND")
+
     state["history"].insert(0, {
-        "side": side, "entry": entry, "sl": sl,
-        "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "exit": exit_price,
-        "result": result, "points": round(points, 2), "pnl": round(pnl, 2),
+        "side": "BUY" if pos["dir"] == 1 else "SELL", "setup": setup,
+        "entry": pos["entry"], "sl": pos["sl"], "tp1": pos["tp1"], "tp2": pos["tp2"],
+        "exit": exit_price, "result": result_label,
+        "points": round(points, 2), "pnl": round(pnl, 2),
     })
     state["history"] = state["history"][:50]
-    state["stats"]["sum_pnl"] += pnl
 
-
-def settle_trade(state, pos, exit_price, result_label, pnl_override=None):
-    points = (exit_price - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - exit_price)
-    pnl = pnl_override if pnl_override is not None else points * LOT_SIZE * UNITS_PER_LOT
-
-    log_trade(state, "BUY" if pos["dir"] == 1 else "SELL",
-              pos["entry"], pos["sl"], pos["tp1"], pos["tp2"], pos["tp3"], pos["tp4"],
-              exit_price, result_label, points, pnl)
-
-    stats = state["stats"]
-    stats["total_trades"] += 1
-    combined_positive = pnl >= 0
-    if combined_positive:
-        stats["wins"] += 1
+    s = state["stats"]
+    s["sum_pnl"] += pnl
+    s["total_trades"] += 1
+    is_win = pnl > 0
+    if is_win:
+        s["wins"] += 1
     else:
-        stats["losses"] += 1
-    stats["best_trade"] = pnl if stats["best_trade"] is None else max(stats["best_trade"], pnl)
-    stats["worst_trade"] = pnl if stats["worst_trade"] is None else min(stats["worst_trade"], pnl)
+        s["losses"] += 1
+        state["losses_today"] = state.get("losses_today", 0) + 1
+    key = {"SMC": "smc", "FORCED": "forced"}.get(setup, "trend")
+    s[f"{key}_n"] = s.get(f"{key}_n", 0) + 1
+    if is_win:
+        s[f"{key}_w"] = s.get(f"{key}_w", 0) + 1
+    s["best_trade"] = pnl if s["best_trade"] is None else max(s["best_trade"], pnl)
+    s["worst_trade"] = pnl if s["worst_trade"] is None else min(s["worst_trade"], pnl)
 
+    state["last_exit_bar_time"] = bar_time
     state["position"] = None
     return pnl
 
 
-# ---------------------- RATCHET HELPERS ----------------------
-def ratchet_to_breakeven(pos):
-    # TP1 hit: SL moves to entry +/- LOCK_PTS in the trade's favor (not pure
-    # breakeven), so a reversal after TP1 still books LOCK_PTS of profit.
-    pos["tp1_hit"] = True
-    pos["remaining_size"] = 0.75
-    pos["sl"] = pos["entry"] + LOCK_PTS if pos["dir"] == 1 else pos["entry"] - LOCK_PTS
+def open_position(e, bar_time):
+    return {
+        "dir": 1 if e["side"] == "BUY" else -1,
+        "entry": e["entry"], "sl": e["sl"], "tp1": e["tp1"], "tp2": e["tp2"],
+        "tp3": None, "tp4": None,   # kept so the dashboard still renders
+        "setup": e["setup"], "entry_time": bar_time,
+        "tp1_hit": False, "lock_bar": None, "remaining_size": 1.0,
+    }
 
 
-def ratchet_to_tp1(pos):
-    pos["tp2_hit"] = True
-    pos["remaining_size"] = 0.5
-    pos["sl"] = pos["tp1"]
-
-
-def ratchet_to_tp2(pos):
-    pos["tp3_hit"] = True
-    pos["remaining_size"] = 0.25
-    pos["sl"] = pos["tp2"]
-
-
-def trail_runner_sl(pos, st_value):
-    if st_value is None or pd.isna(st_value):
-        return
-    if pos["dir"] == 1 and st_value > pos["sl"]:
-        pos["sl"] = st_value
-    elif pos["dir"] == -1 and st_value < pos["sl"]:
-        pos["sl"] = st_value
+def commit_entry(state, e, bar_time):
+    state["position"] = open_position(e, bar_time)
+    state["traded_today"] = True
+    state["force_attempted_today"] = True
+    state["pending_dir"] = None
+    state["pending_bar_time"] = None
+    resets = state.setdefault("smc_reset_times", [])
+    resets.append(bar_time)
+    state["smc_reset_times"] = resets[-200:]
 
 
 # ---------------------- POSITION MANAGEMENT ----------------------
-def manage_position(state, last_candle, st_value, silent=False):
+def manage_position(state, candle, silent=False):
     """
-    silent=True is used by the signal-history walk-back (run_signal_backtest())
-    so replaying history doesn't fire real Telegram alerts. Live /check calls
-    this with no third arg, so silent defaults to False and behavior there is
-    unchanged.
+    Exits are only evaluated on bars AFTER the entry bar (like the indicator).
+    Ratchet mode: TP1 -> SL moves to entry +/- LOCK_PTS (the bar that locks is
+    not checked again for SL/TP2, same as Pine's if/else chain), TP2 closes
+    the whole trade. silent=True is used by the backtest.
     """
     pos = state["position"]
     if pos is None:
         return False
 
-    high, low = last_candle["high"], last_candle["low"]
+    bar_t = str(candle["datetime"])
+    if bar_t <= str(pos["entry_time"]):
+        return False
+    if pos.get("tp1_hit") and pos.get("lock_bar") and bar_t <= str(pos["lock_bar"]):
+        return False  # candle that already locked TP1 (re-polled forming candle)
+
+    high, low = candle["high"], candle["low"]
+    d = pos["dir"]
     events = []
 
-    def buy_side():
-        if PNL_MODE == "tp1_only":
-            if low <= pos["sl"]:
-                pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
-                events.append(("SL Hit", pos["sl"], pnl))
-            elif high >= pos["tp1"]:
-                pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
-                events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        elif PNL_MODE == "first_hit":
-            if low <= pos["sl"]:
-                pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
-                events.append(("SL Hit", pos["sl"], pnl))
-            elif high >= pos["tp4"]:
-                pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Full Close)")
-                events.append(("TP4 Hit (Full Close)", pos["tp4"], pnl))
-            elif high >= pos["tp3"]:
-                pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Full Close)")
-                events.append(("TP3 Hit (Full Close)", pos["tp3"], pnl))
-            elif high >= pos["tp2"]:
-                pnl = settle_trade(state, pos, pos["tp2"], "TP2 Hit (Full Close)")
-                events.append(("TP2 Hit (Full Close)", pos["tp2"], pnl))
-            elif high >= pos["tp1"]:
-                pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
-                events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:
-            if not pos["tp1_hit"]:
-                if low <= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
-                    events.append(("SL Hit", pos["sl"], pnl))
-                elif high >= pos["tp4"]:
-                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap, Full Size)")
-                    events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
-                elif high >= pos["tp3"]:
-                    ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-                    ratchet_to_tp2(pos)
-                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
-                elif high >= pos["tp2"]:
-                    ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-                elif high >= pos["tp1"]:
-                    ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
-            elif pos["tp1_hit"] and not pos["tp2_hit"]:
-                if low <= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Profit Locked)")
-                    events.append(("SL Hit (After TP1 — Profit Locked)", pos["sl"], pnl))
-                elif high >= pos["tp4"]:
-                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
-                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
-                elif high >= pos["tp3"]:
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-                    ratchet_to_tp2(pos)
-                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
-                elif high >= pos["tp2"]:
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-            elif pos["tp2_hit"] and not pos["tp3_hit"]:
-                if low <= pos["sl"]:
-                    points = pos["tp1"] - pos["entry"]
-                    pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2 — Locked at TP1)", pnl_override=pnl)
-                    events.append(("SL Hit (After TP1+TP2 — Locked at TP1)", pos["sl"], pnl))
-                elif high >= pos["tp4"]:
-                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
-                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
-                elif high >= pos["tp3"]:
-                    ratchet_to_tp2(pos)
-                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
-            else:
-                if low <= pos["sl"]:
-                    points = pos["tp2"] - pos["entry"]
-                    pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pnl_override=pnl)
-                    events.append(("SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pos["sl"], pnl))
-                elif high >= pos["tp4"]:
-                    points = pos["tp4"] - pos["entry"]
-                    pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["tp4"], "TP4 Hit (Final Leg)", pnl_override=pnl)
-                    events.append(("TP4 Hit (Final Leg)", pos["tp4"], pnl))
+    def close_(price, label):
+        pnl = settle_trade(state, pos, price, label, bar_t)
+        events.append((label, price, pnl))
 
-    def sell_side():
-        if PNL_MODE == "tp1_only":
-            if high >= pos["sl"]:
-                pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
-                events.append(("SL Hit", pos["sl"], pnl))
-            elif low <= pos["tp1"]:
-                pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
-                events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        elif PNL_MODE == "first_hit":
-            if high >= pos["sl"]:
-                pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
-                events.append(("SL Hit", pos["sl"], pnl))
-            elif low <= pos["tp4"]:
-                pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Full Close)")
-                events.append(("TP4 Hit (Full Close)", pos["tp4"], pnl))
-            elif low <= pos["tp3"]:
-                pnl = settle_trade(state, pos, pos["tp3"], "TP3 Hit (Full Close)")
-                events.append(("TP3 Hit (Full Close)", pos["tp3"], pnl))
-            elif low <= pos["tp2"]:
-                pnl = settle_trade(state, pos, pos["tp2"], "TP2 Hit (Full Close)")
-                events.append(("TP2 Hit (Full Close)", pos["tp2"], pnl))
-            elif low <= pos["tp1"]:
-                pnl = settle_trade(state, pos, pos["tp1"], "TP1 Hit (Full Close)")
-                events.append(("TP1 Hit (Full Close)", pos["tp1"], pnl))
-        else:
-            if not pos["tp1_hit"]:
-                if high >= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit")
-                    events.append(("SL Hit", pos["sl"], pnl))
-                elif low <= pos["tp4"]:
-                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap, Full Size)")
-                    events.append(("TP4 Hit (Gap, Full Size)", pos["tp4"], pnl))
-                elif low <= pos["tp3"]:
-                    ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-                    ratchet_to_tp2(pos)
-                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
-                elif low <= pos["tp2"]:
-                    ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-                elif low <= pos["tp1"]:
-                    ratchet_to_breakeven(pos)
-                    events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
-            elif pos["tp1_hit"] and not pos["tp2_hit"]:
-                if high >= pos["sl"]:
-                    pnl = settle_trade(state, pos, pos["sl"], "SL Hit (After TP1 — Profit Locked)")
-                    events.append(("SL Hit (After TP1 — Profit Locked)", pos["sl"], pnl))
-                elif low <= pos["tp4"]:
-                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
-                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
-                elif low <= pos["tp3"]:
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-                    ratchet_to_tp2(pos)
-                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
-                elif low <= pos["tp2"]:
-                    ratchet_to_tp1(pos)
-                    events.append(("TP2 Hit (SL->TP1)", pos["tp2"], None))
-            elif pos["tp2_hit"] and not pos["tp3_hit"]:
-                if high >= pos["sl"]:
-                    points = pos["entry"] - pos["tp1"]
-                    pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2 — Locked at TP1)", pnl_override=pnl)
-                    events.append(("SL Hit (After TP1+TP2 — Locked at TP1)", pos["sl"], pnl))
-                elif low <= pos["tp4"]:
-                    pnl = settle_trade(state, pos, pos["tp4"], "TP4 Hit (Gap)")
-                    events.append(("TP4 Hit (Gap)", pos["tp4"], pnl))
-                elif low <= pos["tp3"]:
-                    ratchet_to_tp2(pos)
-                    events.append(("TP3 Hit (SL->TP2)", pos["tp3"], None))
-            else:
-                if high >= pos["sl"]:
-                    points = pos["entry"] - pos["tp2"]
-                    pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["sl"], "SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pnl_override=pnl)
-                    events.append(("SL Hit (After TP1+TP2+TP3 — Locked at TP2)", pos["sl"], pnl))
-                elif low <= pos["tp4"]:
-                    points = pos["entry"] - pos["tp4"]
-                    pnl = points * LOT_SIZE * UNITS_PER_LOT
-                    settle_trade(state, pos, pos["tp4"], "TP4 Hit (Final Leg)", pnl_override=pnl)
-                    events.append(("TP4 Hit (Final Leg)", pos["tp4"], pnl))
+    hit_sl = (low <= pos["sl"]) if d == 1 else (high >= pos["sl"])
+    hit_tp1 = (high >= pos["tp1"]) if d == 1 else (low <= pos["tp1"])
+    hit_tp2 = (high >= pos["tp2"]) if d == 1 else (low <= pos["tp2"])
 
-    if pos["dir"] == 1:
-        buy_side()
-    else:
-        sell_side()
+    if PNL_MODE == "tp1_only":
+        if hit_sl:
+            close_(pos["sl"], "SL Hit")
+        elif hit_tp1:
+            close_(pos["tp1"], "TP1 Hit (Full Close)")
+    elif PNL_MODE == "first_hit":
+        if hit_sl:
+            close_(pos["sl"], "SL Hit")
+        elif hit_tp2:
+            close_(pos["tp2"], "TP2 Hit (Full Close)")
+        elif hit_tp1:
+            close_(pos["tp1"], "TP1 Hit (Full Close)")
+    else:  # ratchet
+        if not pos["tp1_hit"]:
+            if hit_sl:
+                close_(pos["sl"], "SL Hit")
+            elif hit_tp2:
+                close_(pos["tp2"], "TP2 Hit (Gap, Full Size)")
+            elif hit_tp1:
+                pos["tp1_hit"] = True
+                pos["lock_bar"] = bar_t
+                pos["sl"] = pos["entry"] + LOCK_PTS if d == 1 else pos["entry"] - LOCK_PTS
+                events.append(("TP1 Hit (SL->Locked Profit)", pos["tp1"], None))
+        else:
+            if hit_sl:
+                close_(pos["sl"], f"SL After TP1 (Locked +{LOCK_PTS})")
+            elif hit_tp2:
+                close_(pos["tp2"], "TP2 Hit (Final)")
 
     if not silent:
-        side = "BUY" if pos["dir"] == 1 else "SELL"
+        side = "BUY" if d == 1 else "SELL"
         for label, price, pnl in events:
             if pnl is None:
-                msg = (
-                    f"XAUUSD {side} — {label}\n"
-                    f"Price: {price:.2f}\n"
-                    f"(Stop loss moved — no P&L booked yet, position still open)"
-                )
+                msg = (f"XAUUSD {side} — {label}\nPrice: {price:.2f}\n"
+                       f"(Stop loss moved — no P&L booked yet, position still open)")
             else:
-                msg = (
-                    f"XAUUSD {side} — {label}\n"
-                    f"Price: {price:.2f}\n"
-                    f"P&L (trade closed): {'+' if pnl >= 0 else ''}${pnl:.2f}"
-                )
+                msg = (f"XAUUSD {side} — {label}\nPrice: {price:.2f}\n"
+                       f"P&L (trade closed): {'+' if pnl >= 0 else '-'}${abs(pnl):.2f}")
             send_telegram(msg)
 
     return len(events) > 0
 
 
-def open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time):
-    return {
-        "dir": 1 if side == "BUY" else -1,
-        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4,
-        "entry_time": bar_time,
-        "tp1_hit": False, "tp2_hit": False, "tp3_hit": False,
-        "remaining_size": 1.0,
-    }
-
-
-# ---------------------- DAILY TRADE GUARANTEE HELPERS ----------------------
+# ---------------------- DAILY / FORCE HELPERS ----------------------
 def roll_daily_guarantee_state(state, bar_dt):
     day_str = bar_dt.strftime("%Y-%m-%d")
     if state.get("current_day") != day_str:
@@ -978,26 +881,24 @@ def roll_daily_guarantee_state(state, bar_dt):
         state["traded_today"] = False
         state["force_attempted_today"] = False
         state["force_skipped_today"] = False
+        state["losses_today"] = 0
 
 
 def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_last,
-                         rsi_val, extension_atr):
+                        rsi_val, extension_atr, risk_ok):
     if not GUARANTEE_DAILY_TRADE:
         return False, 0
 
-    *_, blocked = is_new_entries_blocked(bar_dt)
-    if blocked:
-        return False, 0
-
-    if st_dir == 1 or st_dir == -1:
+    if st_dir in (1, -1):
         force_direction = st_dir
-    elif htf_dir == 1 or htf_dir == -1:
+    elif htf_dir in (1, -1):
         force_direction = htf_dir
     else:
         force_direction = 1 if ema_fast_last >= ema_slow_last else -1
 
-    is_past_force_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HOUR * 60 + FORCE_MINUTE)
-    is_past_hard_time = (bar_dt.hour * 60 + bar_dt.minute) >= (FORCE_HARD_HOUR * 60 + FORCE_HARD_MINUTE)
+    mins = bar_dt.hour * 60 + bar_dt.minute
+    is_past_force_time = mins >= (FORCE_HOUR * 60 + FORCE_MINUTE)
+    is_past_hard_time = mins >= (FORCE_HARD_HOUR * 60 + FORCE_HARD_MINUTE)
 
     force_rsi_ok = (not USE_RSI) or (rsi_val < RSI_OB if force_direction == 1 else rsi_val > RSI_OS)
     force_extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
@@ -1014,26 +915,27 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
         and not state["force_attempted_today"]
         and not state["traded_today"]
         and state["position"] is None
+        and risk_ok                       # Pine: forced entries also need entryOk (cooldown / loss cap)
         and force_can_fire_now
         and not state.get("force_skipped_today", False)
     )
-
     return force_entry_now, force_direction
 
 
-# ---------------------- ENTRY TIMING HELPERS ----------------------
-def bars_since_pending_armed(df, pending_bar_time):
+# ---------------------- PULLBACK STATE ----------------------
+def bars_since_pending_armed(df, i, pending_bar_time):
     if pending_bar_time is None:
         return None
-    target = pd.to_datetime(pending_bar_time)
-    matches = df.index[df["datetime"] == target]
-    if len(matches) == 0:
+    arr = df["datetime"].values
+    target = np.datetime64(pd.to_datetime(pending_bar_time))
+    pos = arr.searchsorted(target)
+    if pos >= len(arr) or arr[pos] != target:
         return PULLBACK_TIMEOUT_BARS + 1
-    return (len(df) - 1) - matches[0]
+    return i - pos
 
 
-def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
-                         base_long_cond, base_short_cond, entries_blocked=False):
+def roll_pullback_state(state, df, i, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
+                        base_long_cond, base_short_cond, entries_blocked=False):
     if base_long_cond:
         state["pending_dir"] = 1
         state["pending_bar_time"] = bar_time
@@ -1041,42 +943,146 @@ def roll_pullback_state(state, df, bar_time, st_bullish, st_bearish, htf_bullish
         state["pending_dir"] = -1
         state["pending_bar_time"] = bar_time
 
-    bars_since = bars_since_pending_armed(df, state["pending_bar_time"])
+    bars_since = bars_since_pending_armed(df, i, state["pending_bar_time"])
+    timed_out = bars_since is not None and bars_since > PULLBACK_TIMEOUT_BARS
 
     if state["pending_dir"] == 1:
-        timed_out = bars_since is not None and bars_since > PULLBACK_TIMEOUT_BARS
         if not st_bullish or not htf_bullish or timed_out or entries_blocked:
             state["pending_dir"] = None
             state["pending_bar_time"] = None
     elif state["pending_dir"] == -1:
-        timed_out = bars_since is not None and bars_since > PULLBACK_TIMEOUT_BARS
         if not st_bearish or not htf_bearish or timed_out or entries_blocked:
             state["pending_dir"] = None
             state["pending_bar_time"] = None
 
 
+# ---------------------- ENTRY EVALUATION (shared by /check and the backtest) ----------------------
+def evaluate_entry(state, df, i, smc, bars_since_exit):
+    """
+    Evaluate bar i (a CLOSED bar) the way the indicator does. The caller must
+    only call this when flat. Returns (entry_dict_or_None, info_dict).
+    df needs: emaFast, emaSlow, rsi, atr, st_dir, bars_since_flip, htf_st_dir.
+    """
+    bar = df.iloc[i]
+    prev = df.iloc[i - 1]
+    bar_dt = bar["datetime"]
+    bar_time = str(bar_dt)
+
+    weekend, outside, day_blk, month_blk, blocked = is_new_entries_blocked(bar_dt)
+    info = {"weekend": weekend, "outside_hours": outside, "day_blocked": day_blk,
+            "month_blocked": month_blk, "blocked": blocked}
+    if blocked:
+        state["pending_dir"] = None
+        state["pending_bar_time"] = None
+        return None, info
+
+    cooldown_ok = bars_since_exit is None or bars_since_exit >= COOLDOWN_BARS
+    loss_ok = MAX_LOSSES_PER_DAY == 0 or state.get("losses_today", 0) < MAX_LOSSES_PER_DAY
+    risk_ok = cooldown_ok and loss_ok
+    info["risk_ok"] = risk_ok
+
+    close_, open_ = bar["close"], bar["open"]
+    ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and bar["emaFast"] > bar["emaSlow"]
+    ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and bar["emaFast"] < bar["emaSlow"]
+    rsi_ok_long = (not USE_RSI) or bar["rsi"] < RSI_OB
+    rsi_ok_short = (not USE_RSI) or bar["rsi"] > RSI_OS
+
+    st_bullish = bar["st_dir"] == 1
+    st_bearish = bar["st_dir"] == -1
+    st_flip_confirmed = bar["bars_since_flip"] >= ST_CONFIRM_BARS
+
+    h_dir = int(bar["htf_st_dir"])
+    htf_bullish = (not USE_HTF) or h_dir == 1
+    htf_bearish = (not USE_HTF) or h_dir == -1
+
+    extension_atr = (abs(close_ - bar["emaFast"]) / bar["atr"]) if bar["atr"] > 0 else 0.0
+    extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
+    pullback_ok = extension_atr <= PULLBACK_MAX_ATR
+
+    base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
+    base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
+
+    roll_pullback_state(state, df, i, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
+                        base_long_cond, base_short_cond, entries_blocked=False)
+
+    gate_long = (not USE_SMC_GATE) or smc["score_long"] >= GATE_MIN_SCORE
+    gate_short = (not USE_SMC_GATE) or smc["score_short"] >= GATE_MIN_SCORE
+
+    if USE_PULLBACK_ENTRY:
+        trend_long_core = state["pending_dir"] == 1 and pullback_ok and st_bullish and htf_bullish and rsi_ok_long
+        trend_short_core = state["pending_dir"] == -1 and pullback_ok and st_bearish and htf_bearish and rsi_ok_short
+    else:
+        trend_long_core, trend_short_core = base_long_cond, base_short_cond
+
+    long_cond = extension_ok and risk_ok and gate_long and trend_long_core
+    short_cond = extension_ok and risk_ok and gate_short and trend_short_core
+
+    # standalone SMC setup: sweep -> confirmation candle
+    bull_confirm = close_ > open_ and close_ > prev["close"]
+    bear_confirm = close_ < open_ and close_ < prev["close"]
+    vol_ok = (not REQUIRE_VOL_SPIKE) or smc["vol_spike"]
+    smc_long = (USE_SMC_TRIGGER and risk_ok and smc["recent_sweep_low"] and bull_confirm and htf_bullish
+                and rsi_ok_long and vol_ok and smc["score_long"] >= TRIG_MIN_SCORE)
+    smc_short = (USE_SMC_TRIGGER and risk_ok and smc["recent_sweep_high"] and bear_confirm and htf_bearish
+                 and rsi_ok_short and vol_ok and smc["score_short"] >= TRIG_MIN_SCORE)
+
+    force_entry_now, force_direction = compute_force_entry(
+        state, bar_dt, int(bar["st_dir"]), h_dir, bar["emaFast"], bar["emaSlow"],
+        bar["rsi"], extension_atr, risk_ok,
+    )
+    force_long = force_entry_now and force_direction == 1
+    force_short = force_entry_now and force_direction == -1
+
+    info["pending_dir"] = state["pending_dir"]
+    info["extension_atr"] = round(float(extension_atr), 3)
+    info["extension_ok"] = bool(extension_ok)
+    info["htf_dir"] = h_dir
+    info["st_dir"] = int(bar["st_dir"])
+
+    is_long = long_cond or smc_long or force_long
+    is_short = short_cond or smc_short or force_short
+    if not (is_long or is_short):
+        return None, info
+
+    sl_dist = min(max(bar["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
+    entry = close_
+
+    if is_long:
+        is_smc = smc_long and not long_cond
+        is_forced = force_long and not long_cond and not smc_long
+        if is_smc and USE_STRUCTURE_SL and _ok(smc["sweep_low_px"]):
+            sl_dist = min(max(close_ - smc["sweep_low_px"] + SL_BUFFER_PTS, SL_MIN_PTS), SL_MAX_PTS)
+        sl = entry - sl_dist
+        risk = entry - sl
+        tp1, tp2 = entry + risk * RR1, entry + risk * RR2
+        side = "BUY"
+    else:
+        is_smc = smc_short and not short_cond
+        is_forced = force_short and not short_cond and not smc_short
+        if is_smc and USE_STRUCTURE_SL and _ok(smc["sweep_high_px"]):
+            sl_dist = min(max(smc["sweep_high_px"] - close_ + SL_BUFFER_PTS, SL_MIN_PTS), SL_MAX_PTS)
+        sl = entry + sl_dist
+        risk = sl - entry
+        tp1, tp2 = entry - risk * RR1, entry - risk * RR2
+        side = "SELL"
+
+    setup = "FORCED" if is_forced else "SMC" if is_smc else "TREND"
+    entry_dict = {
+        "side": side, "setup": setup, "entry": float(entry), "sl": float(sl),
+        "tp1": float(tp1), "tp2": float(tp2),
+        "forced": setup == "FORCED", "smc": setup == "SMC",
+        "pullback": USE_PULLBACK_ENTRY and setup == "TREND",
+        "htf_dir": h_dir, "st_dir": int(bar["st_dir"]),
+    }
+    return entry_dict, info
+
+
 # ---------------------- SIGNAL-COUNT BACKTEST (last N signals) ----------------------
 def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
     """
-    Walks back through Capital.com history -- via fetch_candles_range()'s
-    pagination, so it isn't stuck at Capital.com's 1000-candle-per-request
-    cap -- until it has replayed at least `target_count` of the bot's own
-    trade signals (organic, pullback, or Forced Daily), then reports the
-    most recent `target_count` of them.
-
-    "Signal" means a trade the bot actually opened. Each one is tracked
-    from the moment it opens, so if the very latest signal hasn't closed
-    yet it's still included, marked status "open" with no exit/pnl yet,
-    rather than being silently dropped.
-
-    One Capital.com session is opened up front and reused across every
-    paginated chunk and every HTF fetch in this call, since re-logging-in
-    per chunk would be slow and can hit rate limits once history spans
-    weeks or months.
-
-    Only CLOSED bars are replayed (the still-forming candle is dropped),
-    and each chart bar only sees a higher-timeframe candle once that HTF
-    candle has fully closed -- no look-ahead.
+    Replays the bot's own logic (Trend / SMC / Forced) on closed bars only,
+    with the same HTF handling, spread, cooldown, loss cap and SMC engine as
+    live, until `target_count` signals are found.
     """
     headers = _capital_session_headers()
     days = initial_days
@@ -1097,28 +1103,10 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
             days = min(days * 2, max_days)
             continue
 
-        df["emaFast"] = ema(df["close"], FAST_LEN)
-        df["emaSlow"] = ema(df["close"], SLOW_LEN)
-        df["rsi"] = rsi(df["close"], RSI_LEN)
-        df["atr"] = atr(df, ATR_LEN)
-        st_series, dir_series = supertrend(df, ST_ATR_PERIOD, ST_FACTOR)
-        df["st"] = st_series
-        df["st_dir"] = dir_series
-
+        add_indicators(df)
         if USE_HTF:
             htf_df = fetch_candles_range(HTF_TIMEFRAME, fetch_start, end_date, session_headers=headers)
-            _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
-            htf_df = htf_df[["datetime"]].copy()
-            htf_df["htf_st_dir"] = htf_dir_series.values
-            # A chart bar may only see an HTF candle once that candle has
-            # closed: shift each HTF timestamp (candle OPEN time) forward to
-            # the open time of the last chart bar inside it.
-            htf_minutes = _INTERVAL_MINUTES.get(HTF_TIMEFRAME, 240)
-            tf_minutes = _INTERVAL_MINUTES.get(TIMEFRAME, 5)
-            htf_df["datetime"] = htf_df["datetime"] + pd.Timedelta(minutes=max(htf_minutes - tf_minutes, 0))
-            df = pd.merge_asof(df.sort_values("datetime"), htf_df.sort_values("datetime"),
-                                on="datetime", direction="backward")
-            df["htf_st_dir"] = df["htf_st_dir"].fillna(0).astype(int)
+            df = attach_htf_direction(df, htf_df)
         else:
             df["htf_st_dir"] = 0
 
@@ -1127,126 +1115,47 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
         start_idx = int(cutoff_matches[0]) if len(cutoff_matches) else max(0, len(df) - 1)
         start_idx = max(start_idx, 1)
 
-        bt_state = {
-            "position": None, "history": [],
-            "pending_dir": None, "pending_bar_time": None,
-            "current_day": None, "traded_today": False,
-            "force_attempted_today": False, "force_skipped_today": False,
-            "stats": {"total_trades": 0, "wins": 0, "losses": 0, "sum_pnl": 0.0,
-                      "best_trade": None, "worst_trade": None},
-        }
+        bt = fresh_state()
+        engine = SMCEngine(df)
         all_signals = []
         open_signal_idx = None
+        last_exit_idx = None
 
-        for i in range(start_idx, len(df)):
+        for i in range(len(df)):
+            smc = engine.step(i)
+            if i < start_idx:
+                continue
+
             bar = df.iloc[i]
-            prev = df.iloc[i - 1]
             bar_dt = bar["datetime"]
+            roll_daily_guarantee_state(bt, bar_dt)
 
-            roll_daily_guarantee_state(bt_state, bar_dt)
+            if bt["position"] is not None:
+                manage_position(bt, bar, silent=True)
+                if bt["position"] is None:
+                    last_exit_idx = i
+                    if open_signal_idx is not None:
+                        closed = bt["history"][0]
+                        all_signals[open_signal_idx].update({
+                            "status": "closed", "exit": closed["exit"], "result": closed["result"],
+                            "points": closed["points"], "pnl": closed["pnl"],
+                        })
+                        open_signal_idx = None
+                continue  # no new entry on a bar where a position was open
 
-            if bt_state["position"] is not None:
-                manage_position(bt_state, bar, bar["st"], silent=True)
-                if bt_state["position"] is None and open_signal_idx is not None:
-                    closed = bt_state["history"][0]
-                    all_signals[open_signal_idx].update({
-                        "status": "closed",
-                        "exit": closed["exit"],
-                        "result": closed["result"],
-                        "points": closed["points"],
-                        "pnl": closed["pnl"],
-                    })
-                    open_signal_idx = None
-                # a position that was open coming into this bar (even if it
-                # just closed on it) blocks a new entry on this same bar
-                continue
-
-            weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(bar_dt)
-
-            if blocked_now:
-                if bt_state["pending_dir"] is not None:
-                    bt_state["pending_dir"] = None
-                    bt_state["pending_bar_time"] = None
-                continue
-
-            ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and bar["emaFast"] > bar["emaSlow"]
-            ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and bar["emaFast"] < bar["emaSlow"]
-            rsi_ok_long = (not USE_RSI) or bar["rsi"] < RSI_OB
-            rsi_ok_short = (not USE_RSI) or bar["rsi"] > RSI_OS
-            st_bullish = bar["st_dir"] == 1
-            st_bearish = bar["st_dir"] == -1
-
-            bars_since_flip = bars_since_supertrend_flip(dir_series.iloc[:i + 1])
-            st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
-
-            h_dir = int(bar["htf_st_dir"])
-            htf_bullish = (not USE_HTF) or h_dir == 1
-            htf_bearish = (not USE_HTF) or h_dir == -1
-
-            extension_atr = (abs(bar["close"] - bar["emaFast"]) / bar["atr"]) if bar["atr"] > 0 else 0.0
-            extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
-            pullback_ok = extension_atr <= PULLBACK_MAX_ATR
-
-            base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
-            base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
-
-            roll_pullback_state(
-                bt_state, df.iloc[:i + 1], str(bar_dt), st_bullish, st_bearish, htf_bullish, htf_bearish,
-                base_long_cond, base_short_cond, entries_blocked=blocked_now,
-            )
-
-            if USE_PULLBACK_ENTRY:
-                long_cond = (extension_ok and bt_state["pending_dir"] == 1 and pullback_ok
-                             and st_bullish and htf_bullish and rsi_ok_long)
-                short_cond = (extension_ok and bt_state["pending_dir"] == -1 and pullback_ok
-                              and st_bearish and htf_bearish and rsi_ok_short)
-            else:
-                long_cond = extension_ok and base_long_cond
-                short_cond = extension_ok and base_short_cond
-
-            force_entry_now, force_direction = compute_force_entry(
-                bt_state, bar_dt, int(bar["st_dir"]), h_dir,
-                bar["emaFast"], bar["emaSlow"], bar["rsi"], extension_atr,
-            )
-            force_long_cond = force_entry_now and force_direction == 1
-            force_short_cond = force_entry_now and force_direction == -1
-
-            is_long_entry = long_cond or force_long_cond
-            is_short_entry = short_cond or force_short_cond
-
-            if is_long_entry or is_short_entry:
-                entry = bar["close"]
-                sl_dist = min(max(bar["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
-                if is_long_entry:
-                    sl = entry - sl_dist
-                    risk = entry - sl
-                    tp1, tp2, tp3, tp4 = entry + risk * RR1, entry + risk * RR2, entry + risk * RR3, entry + risk * RR4
-                    side = "BUY"
-                    is_forced = force_long_cond and not long_cond
-                else:
-                    sl = entry + sl_dist
-                    risk = sl - entry
-                    tp1, tp2, tp3, tp4 = entry - risk * RR1, entry - risk * RR2, entry - risk * RR3, entry - risk * RR4
-                    side = "SELL"
-                    is_forced = force_short_cond and not short_cond
-
-                bt_state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, str(bar_dt))
-                bt_state["traded_today"] = True
-                bt_state["force_attempted_today"] = True
-                bt_state["pending_dir"] = None
-                bt_state["pending_bar_time"] = None
-
-                is_pullback = USE_PULLBACK_ENTRY and not is_forced
+            bars_since_exit = None if last_exit_idx is None else i - last_exit_idx
+            entry, _info = evaluate_entry(bt, df, i, smc, bars_since_exit)
+            if entry:
+                commit_entry(bt, entry, str(bar_dt))
+                engine.reset_sweeps()
                 all_signals.append({
-                    "entry_time": str(bar_dt), "side": side,
-                    "entry": round(entry, 2), "sl": round(sl, 2),
-                    "tp1": round(tp1, 2), "tp2": round(tp2, 2), "tp3": round(tp3, 2), "tp4": round(tp4, 2),
-                    "forced": is_forced, "pullback": is_pullback,
+                    "entry_time": str(bar_dt), "side": entry["side"], "setup": entry["setup"],
+                    "entry": round(entry["entry"], 2), "sl": round(entry["sl"], 2),
+                    "tp1": round(entry["tp1"], 2), "tp2": round(entry["tp2"], 2),
+                    "forced": entry["forced"], "smc": entry["smc"], "pullback": entry["pullback"],
                     "status": "open", "exit": None, "result": None, "points": None, "pnl": None,
                 })
                 open_signal_idx = len(all_signals) - 1
-            elif force_entry_now:
-                bt_state["force_attempted_today"] = True
 
         if len(all_signals) >= target_count or days >= max_days:
             break
@@ -1254,13 +1163,17 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
 
     last_signals = all_signals[-target_count:] if len(all_signals) > target_count else all_signals
     closed = [s for s in last_signals if s["status"] == "closed"]
-    wins = sum(1 for s in closed if s["pnl"] is not None and s["pnl"] >= 0)
+    wins = sum(1 for s in closed if s["pnl"] is not None and s["pnl"] > 0)
     losses = len(closed) - wins
     net_pnl = sum(s["pnl"] for s in closed) if closed else 0.0
     win_rate = round((wins / len(closed) * 100), 1) if closed else 0
     pnl_values = [s["pnl"] for s in closed]
-    best_trade = max(pnl_values) if pnl_values else None
-    worst_trade = min(pnl_values) if pnl_values else None
+
+    by_setup = {}
+    for name in ("TREND", "SMC", "FORCED"):
+        grp = [s for s in closed if s["setup"] == name]
+        by_setup[name] = {"n": len(grp), "wins": sum(1 for s in grp if s["pnl"] > 0),
+                          "net_pnl": round(sum(s["pnl"] for s in grp), 2)}
 
     return {
         "requested_signal_count": target_count,
@@ -1271,12 +1184,11 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
         "data_covers_to": str(df.iloc[-1]["datetime"]),
         "closed_trades": len(closed),
         "still_open": len(last_signals) - len(closed),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
+        "wins": wins, "losses": losses, "win_rate": win_rate,
         "net_pnl": round(net_pnl, 2),
-        "best_trade": best_trade,
-        "worst_trade": worst_trade,
+        "best_trade": max(pnl_values) if pnl_values else None,
+        "worst_trade": min(pnl_values) if pnl_values else None,
+        "by_setup": by_setup,
         "signals": last_signals,
     }
 
@@ -1287,62 +1199,37 @@ def check():
     if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD) or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
-    df = fetch_candles(TIMEFRAME, outputsize=500)
-    df["emaFast"] = ema(df["close"], FAST_LEN)
-    df["emaSlow"] = ema(df["close"], SLOW_LEN)
-    df["rsi"] = rsi(df["close"], RSI_LEN)
-    df["atr"] = atr(df, ATR_LEN)
-    st_series, dir_series = supertrend(df, ST_ATR_PERIOD, ST_FACTOR)
-    df["st"] = st_series
-    df["st_dir"] = dir_series
+    df = fetch_candles(TIMEFRAME, outputsize=1000)
+    add_indicators(df)
 
-    # The newest candle from Capital.com is still forming. Like the
-    # indicator (which acts at bar close), NEW SIGNALS are evaluated on the
-    # last CLOSED bar only; the forming candle is used just to catch SL/TP
-    # touches intrabar.
+    # Newest candle is still forming: NEW SIGNALS use the last CLOSED bar only;
+    # the forming candle is only used to catch SL/TP touches.
     live = df.iloc[-1]
     sig_df = df.iloc[:-1].reset_index(drop=True)
     if len(sig_df) < 3:
         return jsonify({"error": "Not enough closed candles returned."}), 500
     last = sig_df.iloc[-1]
-    prev = sig_df.iloc[-2]
-    sig_dir_series = sig_df["st_dir"]
     bar_time = str(last["datetime"])
 
     state = load_state()
     result = {"bar_time": bar_time, "live_bar_time": str(live["datetime"]), "event": None}
 
-    # ---------------------------------------------------------------
-    # POSITION MANAGEMENT, two passes:
-    #   (a) backfill fully CLOSED bars we haven't processed yet (covers a
-    #       poller outage/slow cron skipping whole bars) -- deduped by
-    #       state["last_closed_bar_time"] since closed bars never change.
-    #   (b) ALWAYS re-check the current (possibly still-forming) candle on
-    #       every poll, no dedup -- this is what catches an SL/TP touched
-    #       mid-candle. manage_position() is safe to call repeatedly: it
-    #       only acts on tp1_hit/tp2_hit/tp3_hit flags and a monotonically
-    #       growing high/low, so it can't double-fire or un-trigger.
-    # ---------------------------------------------------------------
     last_closed_str = state.get("last_closed_bar_time")
     if last_closed_str:
-        last_closed_ts = pd.to_datetime(last_closed_str)
-        closed_backlog = sig_df[sig_df["datetime"] > last_closed_ts]
+        closed_backlog = sig_df[sig_df["datetime"] > pd.to_datetime(last_closed_str)]
     else:
         closed_backlog = sig_df.iloc[0:0]
 
     any_managed_event = False
-    # Was a position already open going INTO the signal bar? (The indicator
-    # only looks for an entry when it is flat at that point -- a trade that
-    # closes ON the signal bar doesn't allow a new entry on that same bar.)
     flat_before_signal_bar = None
 
-    # (a) backfill any closed bars we haven't processed yet
+    # (a) backfill closed bars not processed yet
     for _, bar in closed_backlog.iterrows():
         if str(bar["datetime"]) == bar_time:
             flat_before_signal_bar = state["position"] is None
         roll_daily_guarantee_state(state, bar["datetime"])
         if state["position"] is not None:
-            any_managed_event = manage_position(state, bar, bar["st"]) or any_managed_event
+            any_managed_event = manage_position(state, bar) or any_managed_event
         state["last_closed_bar_time"] = str(bar["datetime"])
 
     if flat_before_signal_bar is None:
@@ -1351,158 +1238,83 @@ def check():
         state["last_closed_bar_time"] = bar_time
     roll_daily_guarantee_state(state, last["datetime"])
 
-    # (b) always re-check the current/latest candle, dedup or not
+    # (b) always re-check the forming candle for intrabar SL/TP touches
     if state["position"] is not None:
-        any_managed_event = manage_position(state, live, live["st"]) or any_managed_event
+        any_managed_event = manage_position(state, live) or any_managed_event
 
     if any_managed_event:
         result["event"] = "position_update"
     save_state(state)
 
-    # Session guard: don't evaluate/open any NEW signal (organic or forced)
-    # while the signal bar is a Saturday/Sunday in FORCE_TIMEZONE, OR outside
-    # the configured trading-hours window, OR on an unselected trading day.
-    # Also explicitly clears any pending pullback signal that was armed
-    # before the block started.
-    weekend_now, outside_hours_now, day_blocked_now, blocked_now = is_new_entries_blocked(last["datetime"])
+    weekend_now, outside_now, day_now, month_now, blocked_now = is_new_entries_blocked(last["datetime"])
     if blocked_now:
         state["last_signal_bar"] = bar_time
-        if state.get("pending_dir") is not None:
-            state["pending_dir"] = None
-            state["pending_bar_time"] = None
+        state["pending_dir"] = None
+        state["pending_bar_time"] = None
         result["weekend_skipped"] = weekend_now
-        result["trading_hours_skipped"] = outside_hours_now
-        result["day_skipped"] = day_blocked_now
+        result["trading_hours_skipped"] = outside_now
+        result["day_skipped"] = day_now
+        result["month_skipped"] = month_now
         save_state(state)
 
-    # Only look for a NEW entry once per closed bar, and only if we were flat
-    # going into that bar and it isn't blocked by the session filters.
     elif state.get("last_signal_bar") != bar_time:
-        state["last_signal_bar"] = bar_time  # mark this closed bar as handled
+        state["last_signal_bar"] = bar_time
 
         if flat_before_signal_bar and state["position"] is None:
-            ema_cross_up = prev["emaFast"] <= prev["emaSlow"] and last["emaFast"] > last["emaSlow"]
-            ema_cross_down = prev["emaFast"] >= prev["emaSlow"] and last["emaFast"] < last["emaSlow"]
-
-            rsi_ok_long = (not USE_RSI) or last["rsi"] < RSI_OB
-            rsi_ok_short = (not USE_RSI) or last["rsi"] > RSI_OS
-
-            st_bullish = last["st_dir"] == 1
-            st_bearish = last["st_dir"] == -1
-
-            bars_since_flip = bars_since_supertrend_flip(sig_dir_series)
-            st_flip_confirmed = bars_since_flip >= ST_CONFIRM_BARS
-
-            htf_dir = 0
             if USE_HTF:
                 htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=500)
-                _, htf_dir_series = supertrend(htf_df, HTF_ATR_PERIOD, HTF_FACTOR)
-                htf_dir = htf_direction_from_series(htf_dir_series)
-            htf_bullish = (not USE_HTF) or htf_dir == 1
-            htf_bearish = (not USE_HTF) or htf_dir == -1
-
-            extension_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
-            extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
-
-            pullback_dist_atr = (abs(last["close"] - last["emaFast"]) / last["atr"]) if last["atr"] > 0 else 0.0
-            pullback_ok = pullback_dist_atr <= PULLBACK_MAX_ATR
-
-            base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
-            base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
-
-            roll_pullback_state(
-                state, sig_df, bar_time, st_bullish, st_bearish, htf_bullish, htf_bearish,
-                base_long_cond, base_short_cond, entries_blocked=blocked_now,
-            )
-
-            if USE_PULLBACK_ENTRY:
-                long_cond = (
-                    extension_ok and state["pending_dir"] == 1 and pullback_ok
-                    and st_bullish and htf_bullish and rsi_ok_long
-                )
-                short_cond = (
-                    extension_ok and state["pending_dir"] == -1 and pullback_ok
-                    and st_bearish and htf_bearish and rsi_ok_short
-                )
+                sig_df = attach_htf_direction(sig_df, htf_df)
             else:
-                long_cond = extension_ok and base_long_cond
-                short_cond = extension_ok and base_short_cond
+                sig_df["htf_st_dir"] = 0
 
-            force_entry_now, force_direction = compute_force_entry(
-                state, last["datetime"], int(last["st_dir"]), htf_dir,
-                last["emaFast"], last["emaSlow"],
-                last["rsi"], extension_atr,
-            )
-            force_long_cond = force_entry_now and force_direction == 1
-            force_short_cond = force_entry_now and force_direction == -1
+            # Replay the SMC engine over the fetched window. Entries wipe the
+            # sweep memory, so re-apply those wipes at the stored entry times.
+            engine = SMCEngine(sig_df)
+            reset_times = set(state.get("smc_reset_times", []))
+            smc = None
+            for j in range(len(sig_df)):
+                smc = engine.step(j)
+                if str(sig_df.at[j, "datetime"]) in reset_times and j < len(sig_df) - 1:
+                    engine.reset_sweeps()
 
-            is_long_entry = long_cond or force_long_cond
-            is_short_entry = short_cond or force_short_cond
+            bars_since_exit = None
+            if state.get("last_exit_bar_time"):
+                exit_ts = pd.to_datetime(state["last_exit_bar_time"])
+                bars_since_exit = int((sig_df["datetime"] > exit_ts).sum())
 
+            i = len(sig_df) - 1
+            entry, info = evaluate_entry(state, sig_df, i, smc, bars_since_exit)
             result["pending"] = {
                 "dir": state["pending_dir"],
-                "extension_atr": round(extension_atr, 3),
-                "extension_ok": extension_ok,
+                "extension_atr": info.get("extension_atr"),
+                "extension_ok": info.get("extension_ok"),
             }
+            result["smc"] = {"score_long": smc["score_long"], "score_short": smc["score_short"],
+                             "structure": smc["struct_dir"]}
 
-            if is_long_entry or is_short_entry:
-                entry = last["close"]
-                sl_dist = min(max(last["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
-
-                if is_long_entry:
-                    sl = entry - sl_dist
-                    risk = entry - sl
-                    tp1 = entry + risk * RR1
-                    tp2 = entry + risk * RR2
-                    tp3 = entry + risk * RR3
-                    tp4 = entry + risk * RR4
-                    side = "BUY"
-                    is_forced = force_long_cond and not long_cond
-                else:
-                    sl = entry + sl_dist
-                    risk = sl - entry
-                    tp1 = entry - risk * RR1
-                    tp2 = entry - risk * RR2
-                    tp3 = entry - risk * RR3
-                    tp4 = entry - risk * RR4
-                    side = "SELL"
-                    is_forced = force_short_cond and not short_cond
-
-                state["position"] = open_position(side, entry, sl, tp1, tp2, tp3, tp4, bar_time)
-                state["traded_today"] = True
-                state["force_attempted_today"] = True
-                state["pending_dir"] = None
-                state["pending_bar_time"] = None
-
-                is_pullback = USE_PULLBACK_ENTRY and not is_forced
-                tag = "(Forced Daily)" if is_forced else "(Supertrend, Pullback)" if is_pullback else "(Supertrend)"
-                htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(htf_dir)}\n" if USE_HTF else ""
+            if entry:
+                commit_entry(state, entry, bar_time)
+                tag = {"FORCED": "(Forced Daily)", "SMC": "(SMC Sweep)"}.get(
+                    entry["setup"], "(Trend, Pullback)" if entry["pullback"] else "(Trend)")
+                htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(entry['htf_dir'])}\n" if USE_HTF else ""
                 msg = (
-                    f"XAUUSD {side} signal {tag}\n"
-                    f"Entry: {entry:.2f}\n"
-                    f"SL: {sl:.2f}\n"
-                    f"TP1: {tp1:.2f}\n"
-                    f"TP2: {tp2:.2f}\n"
-                    f"TP3: {tp3:.2f}\n"
-                    f"TP4: {tp4:.2f}\n"
-                    f"Supertrend ({TIMEFRAME}): {trend_arrow(last['st_dir'])}\n"
+                    f"XAUUSD {entry['side']} signal {tag}\n"
+                    f"Entry: {entry['entry']:.2f}\n"
+                    f"SL: {entry['sl']:.2f}\n"
+                    f"TP1: {entry['tp1']:.2f}\n"
+                    f"TP2: {entry['tp2']:.2f}\n"
+                    f"Supertrend ({TIMEFRAME}): {trend_arrow(entry['st_dir'])}\n"
                     f"{htf_line}"
+                    f"SMC score L/S: {smc['score_long']} / {smc['score_short']}\n"
                     f"Bar: {bar_time} ({FORCE_TIMEZONE})"
                 )
                 send_telegram(msg)
-                result["event"] = "entry"
-                result["side"] = side
-                result["forced"] = is_forced
-                result["pullback"] = is_pullback
-                result["message"] = msg
-                result["entry"] = entry
-                result["sl"] = sl
-                result["tp1"] = tp1
-                result["tp2"] = tp2
-                result["tp3"] = tp3
-                result["tp4"] = tp4
-            elif force_entry_now:
-                state["force_attempted_today"] = True
+                result.update({
+                    "event": "entry", "side": entry["side"], "setup": entry["setup"],
+                    "forced": entry["forced"], "smc_entry": entry["smc"], "pullback": entry["pullback"],
+                    "message": msg, "entry": entry["entry"], "sl": entry["sl"],
+                    "tp1": entry["tp1"], "tp2": entry["tp2"],
+                })
 
         save_state(state)
 
@@ -1529,65 +1341,46 @@ def stats():
         "wins": s["wins"], "losses": s["losses"],
         "net_pnl": round(s["sum_pnl"], 2),
         "best_trade": s["best_trade"], "worst_trade": s["worst_trade"],
+        "setup_stats": {k: s.get(k, 0) for k in
+                        ("trend_n", "trend_w", "smc_n", "smc_w", "forced_n", "forced_w")},
         "recent_log": state["history"][:10],
         "daily_guarantee": {
             "enabled": GUARANTEE_DAILY_TRADE,
-            "force_hour": FORCE_HOUR,
-            "force_minute": FORCE_MINUTE,
+            "force_hour": FORCE_HOUR, "force_minute": FORCE_MINUTE,
             "force_timezone": FORCE_TIMEZONE,
             "current_day": state.get("current_day"),
             "traded_today": state.get("traded_today"),
             "force_attempted_today": state.get("force_attempted_today"),
             "force_skipped_today": state.get("force_skipped_today", False),
             "require_quality_filters": FORCE_REQUIRE_QUALITY_FILTERS,
-            "hard_cutoff_hour": FORCE_HARD_HOUR,
-            "hard_cutoff_minute": FORCE_HARD_MINUTE,
+            "hard_cutoff_hour": FORCE_HARD_HOUR, "hard_cutoff_minute": FORCE_HARD_MINUTE,
             "skip_if_never_valid": FORCE_SKIP_IF_NEVER_VALID,
         },
-        "pending_signal": {
-            "dir": state.get("pending_dir"),
-            "armed_bar_time": state.get("pending_bar_time"),
+        "risk_guard": {
+            "losses_today": state.get("losses_today", 0),
+            "max_losses_per_day": MAX_LOSSES_PER_DAY,
+            "cooldown_bars": COOLDOWN_BARS,
         },
-        "weekend_guard": {
-            "enabled": DISABLE_WEEKEND_SIGNALS,
-        },
+        "pending_signal": {"dir": state.get("pending_dir"), "armed_bar_time": state.get("pending_bar_time")},
+        "weekend_guard": {"enabled": DISABLE_WEEKEND_SIGNALS},
+        "month_end_pause": {"enabled": USE_MONTH_END_PAUSE, "days": MONTH_END_PAUSE_DAYS},
         "trading_hours": {
             "enabled": USE_TRADING_HOURS,
-            "start_hour": TRADING_START_HOUR,
-            "start_minute": TRADING_START_MINUTE,
-            "end_hour": TRADING_END_HOUR,
-            "end_minute": TRADING_END_MINUTE,
+            "start_hour": TRADING_START_HOUR, "start_minute": TRADING_START_MINUTE,
+            "end_hour": TRADING_END_HOUR, "end_minute": TRADING_END_MINUTE,
             "timezone": FORCE_TIMEZONE,
         },
-        "day_filter": {
-            "enabled": USE_DAY_FILTER,
-            "selected_days": selected_days,
-            "timezone": FORCE_TIMEZONE,
-        },
+        "day_filter": {"enabled": USE_DAY_FILTER, "selected_days": selected_days, "timezone": FORCE_TIMEZONE},
     }
-
     if _notify_requested():
         send_telegram(build_stats_telegram_message(payload, state))
         payload["telegram_notified"] = True
-
     return jsonify(payload)
 
 
 @app.route("/signals", methods=["GET"])
 def signals_history():
-    """
-    GET /signals                -> last 120 signals (default)
-    GET /signals?count=50       -> last 50 signals
-    GET /signals?notify=true    -> also posts a summary to Telegram
-
-    Walks back through Capital.com history -- paginating past the
-    1000-candle-per-request cap as needed, which is what let TradingView's
-    5000-bar chart limit hold you back before -- until it has replayed at
-    least `count` of the bot's own trade signals (organic, pullback, or
-    Forced Daily), then reports win rate, net P&L, and the full list of
-    those signals (including one still open, if the most recent signal
-    hasn't closed yet).
-    """
+    """GET /signals?count=120[&notify=true] -- replay the bot's logic on history."""
     if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
         return jsonify({"error": "Missing Capital.com credentials (CAPITAL_API_KEY / CAPITAL_IDENTIFIER / CAPITAL_PASSWORD)"}), 500
 
@@ -1596,21 +1389,22 @@ def signals_history():
         result = run_signal_backtest(target_count=count)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     if "error" in result:
         return jsonify(result), 400
 
     if _notify_requested():
+        bs = result["by_setup"]
         msg = (
             f"📊 [Last {result['signals_returned']} Signals] XAUUSD\n"
             f"Scanned back {result['days_scanned']}d "
             f"({result['closed_trades']} closed, {result['still_open']} still open)\n"
             f"Win rate: {result['win_rate']}% ({result['wins']}W / {result['losses']}L)\n"
-            f"Net P&L: {'+' if result['net_pnl'] >= 0 else ''}${result['net_pnl']:.2f}"
+            f"Net P&L: {'+' if result['net_pnl'] >= 0 else '-'}${abs(result['net_pnl']):.2f}\n"
+            f"Trend {bs['TREND']['wins']}/{bs['TREND']['n']} | SMC {bs['SMC']['wins']}/{bs['SMC']['n']} | "
+            f"Forced {bs['FORCED']['wins']}/{bs['FORCED']['n']}"
         )
         send_telegram(msg)
         result["telegram_notified"] = True
-
     return jsonify(result)
 
 
@@ -1622,24 +1416,14 @@ def test_signal():
     df = fetch_candles(TIMEFRAME, outputsize=100)
     df["atr"] = atr(df, ATR_LEN)
     last = df.iloc[-1]
-
     entry = last["close"]
     sl_dist = min(max(last["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
     sl = entry - sl_dist
     risk = entry - sl
-    tp1 = entry + risk * RR1
-    tp2 = entry + risk * RR2
-    tp3 = entry + risk * RR3
-    tp4 = entry + risk * RR4
-
     msg = (
-        f"[TEST] XAUUSD BUY signal (Supertrend)\n"
-        f"Entry: {entry:.2f}\n"
-        f"SL: {sl:.2f}\n"
-        f"TP1: {tp1:.2f}\n"
-        f"TP2: {tp2:.2f}\n"
-        f"TP3: {tp3:.2f}\n"
-        f"TP4: {tp4:.2f}\n"
+        f"[TEST] XAUUSD BUY signal (Trend)\n"
+        f"Entry: {entry:.2f}\nSL: {sl:.2f}\n"
+        f"TP1: {entry + risk * RR1:.2f}\nTP2: {entry + risk * RR2:.2f}\n"
         f"Bar: {last['datetime']} ({FORCE_TIMEZONE})\n"
         f"(This is a forced test message, not a real signal)"
     )
@@ -1649,12 +1433,8 @@ def test_signal():
 
 @app.route("/capital-status", methods=["GET"])
 def capital_status():
-    """Replaces the old /keys (Twelve Data) and /fxcm-status endpoints.
-    Confirms the API key/login/password actually authenticate and that a
-    real candle can be pulled for SYMBOL (your configured epic)."""
     if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD):
         return jsonify({"configured": False, "error": "CAPITAL_API_KEY / CAPITAL_IDENTIFIER / CAPITAL_PASSWORD not fully set"}), 500
-
     try:
         headers = _capital_session_headers()
         r = requests.get(
@@ -1664,13 +1444,9 @@ def capital_status():
         symbol_available = r.status_code == 200 and bool(r.json().get("prices"))
     except Exception as e:
         return jsonify({"configured": True, "connected": False, "error": str(e)}), 500
-
     return jsonify({
-        "configured": True,
-        "connected": True,
-        "base_url": CAPITAL_BASE_URL,
-        "symbol": SYMBOL,
-        "symbol_available": symbol_available,
+        "configured": True, "connected": True, "base_url": CAPITAL_BASE_URL,
+        "symbol": SYMBOL, "symbol_available": symbol_available,
     })
 
 
@@ -1678,6 +1454,7 @@ def capital_status():
 def health():
     return jsonify({
         "status": "ok",
+        "synced_with": "Gold Signal Terminal v2 (Trend + SMC + Flow Proxy)",
         "data_provider": "Capital.com",
         "capital_configured": bool(CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD),
         "capital_base_url": CAPITAL_BASE_URL,
@@ -1688,29 +1465,31 @@ def health():
         "rsi": f"len {RSI_LEN}, block buys > {RSI_OB}, block sells < {RSI_OS}",
         "ema": f"{FAST_LEN}/{SLOW_LEN}",
         "use_htf": USE_HTF,
-        "htf_timeframe": HTF_TIMEFRAME if USE_HTF else None,
+        "htf": f"{HTF_TIMEFRAME} ATR {HTF_ATR_PERIOD} / factor {HTF_FACTOR}" if USE_HTF else None,
         "st_confirm_bars": ST_CONFIRM_BARS,
+        "smc": {
+            "gate": USE_SMC_GATE, "gate_min_score": GATE_MIN_SCORE,
+            "trigger": USE_SMC_TRIGGER, "trigger_min_score": TRIG_MIN_SCORE,
+            "swing_len": SWING_LEN, "sweep_lookback": SWEEP_LOOKBACK,
+            "structure_sl": USE_STRUCTURE_SL, "flow_proxy": USE_FLOW,
+        },
         "use_pullback_entry": USE_PULLBACK_ENTRY,
         "pullback_max_atr": PULLBACK_MAX_ATR,
         "pullback_timeout_bars": PULLBACK_TIMEOUT_BARS,
         "use_extension_filter": USE_EXTENSION_FILTER,
         "max_extension_atr": MAX_EXTENSION_ATR,
-        "pnl_mode": PNL_MODE,
-        "lock_pts_at_tp1": LOCK_PTS,
+        "risk": {"sl_mult": SL_MULT, "sl_min": SL_MIN_PTS, "sl_max": SL_MAX_PTS,
+                 "rr1": RR1, "rr2": RR2, "lock_pts": LOCK_PTS, "spread_pts": SPREAD_PTS,
+                 "lot": LOT_SIZE, "pnl_mode": PNL_MODE},
+        "risk_guard": {"max_losses_per_day": MAX_LOSSES_PER_DAY, "cooldown_bars": COOLDOWN_BARS},
         "guarantee_daily_trade": GUARANTEE_DAILY_TRADE,
-        "force_hour": FORCE_HOUR,
-        "force_minute": FORCE_MINUTE,
-        "force_timezone": FORCE_TIMEZONE,
+        "force": f"{FORCE_HOUR:02d}:{FORCE_MINUTE:02d} {FORCE_TIMEZONE}, hard {FORCE_HARD_HOUR:02d}:{FORCE_HARD_MINUTE:02d}",
         "force_require_quality_filters": FORCE_REQUIRE_QUALITY_FILTERS,
-        "force_hard_hour": FORCE_HARD_HOUR if FORCE_REQUIRE_QUALITY_FILTERS else None,
-        "force_hard_minute": FORCE_HARD_MINUTE if FORCE_REQUIRE_QUALITY_FILTERS else None,
         "force_skip_if_never_valid": FORCE_SKIP_IF_NEVER_VALID,
         "disable_weekend_signals": DISABLE_WEEKEND_SIGNALS,
-        "use_trading_hours": USE_TRADING_HOURS,
-        "trading_start": f"{TRADING_START_HOUR:02d}:{TRADING_START_MINUTE:02d}" if USE_TRADING_HOURS else None,
-        "trading_end": f"{TRADING_END_HOUR:02d}:{TRADING_END_MINUTE:02d}" if USE_TRADING_HOURS else None,
-        "use_day_filter": USE_DAY_FILTER,
+        "trading_hours": f"{TRADING_START_HOUR:02d}:{TRADING_START_MINUTE:02d}-{TRADING_END_HOUR:02d}:{TRADING_END_MINUTE:02d}" if USE_TRADING_HOURS else None,
         "selected_days": [name for name, flag in _DAY_LABEL_FLAGS if flag] if USE_DAY_FILTER else None,
+        "month_end_pause_days": MONTH_END_PAUSE_DAYS if USE_MONTH_END_PAUSE else None,
         "dashboard": "/dashboard",
         "signals_endpoint": "/signals?count=120",
     })
@@ -1763,7 +1542,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .wrap{max-width:920px;margin:0 auto;}
 
-  /* ---- Header / ticker ---- */
   header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;}
   .brand{display:flex;align-items:center;gap:12px;}
   .brand .mark{
@@ -1784,14 +1562,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dot{width:7px;height:7px;border-radius:50%;background:var(--buy);box-shadow:0 0 0 3px var(--buy-glow);animation:pulse 2s infinite;}
   @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.4;}}
 
-  /* ---- Candlestick divider (signature element) ---- */
   .divider{display:flex;align-items:flex-end;gap:3px;height:34px;margin:22px 0 26px;opacity:.9;}
   .divider .bar{flex:1;max-width:9px;border-radius:2px 2px 0 0;background:var(--border);}
   .divider .bar.up{background:linear-gradient(180deg, var(--buy), transparent);}
   .divider .bar.down{background:linear-gradient(180deg, var(--sell), transparent);}
   .divider .bar.gold{background:linear-gradient(180deg, var(--gold), transparent);}
 
-  /* ---- Action cards ---- */
   .actions{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
   @media (max-width:600px){.actions{grid-template-columns:1fr;}}
   .card{
@@ -1831,7 +1607,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-family:var(--mono);font-size:13px;border-radius:7px;padding:6px 8px;text-align:right;
   }
 
-  /* ---- Results panel ---- */
   .results{margin-top:20px;}
   .empty{
     border:1px dashed var(--border);border-radius:14px;padding:32px 20px;
@@ -1895,7 +1670,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="mark">Au</div>
       <div>
         <h1>XAUUSD Signal Desk</h1>
-        <div class="sub">Supertrend + EMA/RSI engine</div>
+        <div class="sub">Trend + SMC + Flow proxy engine</div>
       </div>
     </div>
     <div class="live-pill"><span class="dot"></span> engine online</div>
@@ -2034,12 +1809,13 @@ function renderError(msg){
   document.getElementById('results').innerHTML = `<div class="error-box">⚠ ${esc(msg)}</div>`;
 }
 
-function eventBadge(event, weekendSkipped, hoursSkipped, daySkipped){
+function eventBadge(event, weekendSkipped, hoursSkipped, daySkipped, monthSkipped){
   if(event === 'entry') return `<span class="badge neutral">New Entry</span>`;
   if(event === 'position_update') return `<span class="badge muted">Position Updated</span>`;
   if(weekendSkipped) return `<span class="badge muted">Weekend — Skipped</span>`;
   if(hoursSkipped) return `<span class="badge muted">Outside Trading Hours</span>`;
   if(daySkipped) return `<span class="badge muted">Day Not Selected</span>`;
+  if(monthSkipped) return `<span class="badge muted">Month-End Pause</span>`;
   return `<span class="badge muted">No Signal</span>`;
 }
 
@@ -2048,11 +1824,10 @@ function positionKv(pos){
   const side = pos.dir === 1 ? 'BUY' : 'SELL';
   const sideClass = pos.dir === 1 ? 'buy' : 'sell';
   return `
-    <div class="kv"><span class="k">Side</span><span class="v side-tag ${sideClass}">${side}</span></div>
+    <div class="kv"><span class="k">Side</span><span class="v side-tag ${sideClass}">${side}${pos.setup ? ' (' + esc(pos.setup) + ')' : ''}</span></div>
     <div class="kv"><span class="k">Entry</span><span class="v">${fmtPrice(pos.entry)}</span></div>
-    <div class="kv"><span class="k">Stop Loss</span><span class="v">${fmtPrice(pos.sl)}</span></div>
-    <div class="kv"><span class="k">TP1 / TP2 / TP3 / TP4</span><span class="v">${fmtPrice(pos.tp1)} / ${fmtPrice(pos.tp2)} / ${fmtPrice(pos.tp3)} / ${fmtPrice(pos.tp4)}</span></div>
-    <div class="kv"><span class="k">Remaining size</span><span class="v">${Math.round(pos.remaining_size*100)}%</span></div>
+    <div class="kv"><span class="k">Stop Loss</span><span class="v">${fmtPrice(pos.sl)}${pos.tp1_hit ? ' (locked)' : ''}</span></div>
+    <div class="kv"><span class="k">TP1 / TP2</span><span class="v">${fmtPrice(pos.tp1)} / ${fmtPrice(pos.tp2)}</span></div>
   `;
 }
 
@@ -2064,13 +1839,14 @@ function renderCheck(data){
     entryBlock = `
       <div class="section-label">New Signal</div>
       <div class="grid5">
-        <div class="stat-box"><div class="k">Side</div><div class="v side-tag ${sideClass}">${data.side}${data.forced ? ' ⚡' : ''}</div></div>
+        <div class="stat-box"><div class="k">Side</div><div class="v side-tag ${sideClass}">${data.side}${data.forced ? ' ⚡' : (data.smc_entry ? ' ◆' : '')}</div></div>
+        <div class="stat-box"><div class="k">Setup</div><div class="v gold" style="font-size:13px">${esc(data.setup || '—')}</div></div>
         <div class="stat-box"><div class="k">Entry</div><div class="v gold">${fmtPrice(data.entry)}</div></div>
         <div class="stat-box"><div class="k">Stop Loss</div><div class="v neg">${fmtPrice(data.sl)}</div></div>
         <div class="stat-box"><div class="k">TP1 / TP2</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp1)} · ${fmtPrice(data.tp2)}</div></div>
-        <div class="stat-box"><div class="k">TP3 / TP4</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp3)} · ${fmtPrice(data.tp4)}</div></div>
       </div>
       ${data.forced ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">⚡ Opened by the Daily Trade Guarantee fallback, not the organic signal stack.</p>` : ''}
+      ${data.smc_entry ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">◆ Standalone SMC setup: liquidity sweep + confirmation candle.</p>` : ''}
       ${data.pullback ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">↩ Opened after a pullback confirmation, not on the initial cross bar.</p>` : ''}
     `;
   }
@@ -2080,6 +1856,10 @@ function renderCheck(data){
     const dirLabel = data.pending.dir === 1 ? 'LONG' : 'SHORT';
     pendingBlock = `<div class="kv"><span class="k">Pending signal</span><span class="v">${dirLabel} (waiting for pullback)</span></div>`;
   }
+  let smcBlock = '';
+  if(data.smc){
+    smcBlock = `<div class="kv"><span class="k">SMC score L / S</span><span class="v">${data.smc.score_long} / ${data.smc.score_short}</span></div>`;
+  }
 
   let sessionBlock = '';
   if(data.weekend_skipped){
@@ -2088,18 +1868,21 @@ function renderCheck(data){
     sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">🌙 Outside trading hours — new-signal checks are paused. Any open position is still tracked.</p>`;
   }else if(data.day_skipped){
     sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">📅 Today isn't a selected trading day — new-signal checks are paused. Any open position is still tracked.</p>`;
+  }else if(data.month_skipped){
+    sessionBlock = `<p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">📅 Month-end pause — new-signal checks are paused. Any open position is still tracked.</p>`;
   }
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
       <div class="panel-head">
-        <div class="title">Check Result ${eventBadge(data.event, data.weekend_skipped, data.trading_hours_skipped, data.day_skipped)} ${notifiedBadge}</div>
+        <div class="title">Check Result ${eventBadge(data.event, data.weekend_skipped, data.trading_hours_skipped, data.day_skipped, data.month_skipped)} ${notifiedBadge}</div>
         <div class="timestamp">${esc(data.bar_time || '—')}</div>
       </div>
       <div class="panel-body">
         ${entryBlock}
         ${sessionBlock}
         ${pendingBlock}
+        ${smcBlock}
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}
       </div>
@@ -2116,18 +1899,21 @@ function renderStats(data){
     return `
       <tr>
         <td class="side-tag ${sideClass}">${esc(t.side)}</td>
+        <td>${esc(t.setup || '')}</td>
         <td>${fmtPrice(t.entry)}</td>
         <td>${fmtPrice(t.exit)}</td>
         <td>${esc(t.result)}</td>
         <td class="${pnlC}">${fmtMoney(t.pnl)}</td>
       </tr>
     `;
-  }).join('') || `<tr><td colspan="5" style="color:var(--text-faint);text-align:center;">No trades logged yet</td></tr>`;
+  }).join('') || `<tr><td colspan="6" style="color:var(--text-faint);text-align:center;">No trades logged yet</td></tr>`;
 
   const dg = data.daily_guarantee || {};
   const ps = data.pending_signal || {};
   const th = data.trading_hours || {};
   const df = data.day_filter || {};
+  const ss = data.setup_stats || {};
+  const rg = data.risk_guard || {};
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
@@ -2143,11 +1929,19 @@ function renderStats(data){
           <div class="stat-box"><div class="k">Total Trades</div><div class="v">${data.total_trades}</div></div>
         </div>
 
+        <div class="section-label">By Setup (wins / trades)</div>
+        <div class="kv"><span class="k">Trend</span><span class="v">${ss.trend_w || 0} / ${ss.trend_n || 0}</span></div>
+        <div class="kv"><span class="k">SMC</span><span class="v">${ss.smc_w || 0} / ${ss.smc_n || 0}</span></div>
+        <div class="kv"><span class="k">Forced</span><span class="v">${ss.forced_w || 0} / ${ss.forced_n || 0}</span></div>
+
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}
 
         <div class="section-label">Pending Signal</div>
         <div class="kv"><span class="k">Armed</span><span class="v">${ps.dir ? (ps.dir === 1 ? 'LONG (waiting for pullback)' : 'SHORT (waiting for pullback)') : 'None'}</span></div>
+
+        <div class="section-label">Risk Guard</div>
+        <div class="kv"><span class="k">Losses today / cap</span><span class="v">${rg.losses_today || 0} / ${rg.max_losses_per_day ? rg.max_losses_per_day : '∞'}</span></div>
 
         <div class="section-label">Daily Trade Guarantee</div>
         <div class="kv"><span class="k">Status</span><span class="v">${dg.enabled ? 'Enabled' : 'Disabled'} @ ${String(dg.force_hour).padStart(2,'0')}:${String(dg.force_minute).padStart(2,'0')}</span></div>
@@ -2162,7 +1956,7 @@ function renderStats(data){
         <div class="section-label">Recent Trades</div>
         <div class="scroll-x">
           <table>
-            <thead><tr><th>Side</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&amp;L</th></tr></thead>
+            <thead><tr><th>Side</th><th>Setup</th><th>Entry</th><th>Exit</th><th>Result</th><th>P&amp;L</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>
@@ -2174,10 +1968,11 @@ function renderStats(data){
 function renderSignals(data){
   const notifiedBadge = data.telegram_notified ? `<span class="badge neutral">Sent to Telegram</span>` : '';
   const pnlClass = data.net_pnl > 0 ? 'pos' : (data.net_pnl < 0 ? 'neg' : '');
+  const bs = data.by_setup || {};
   const rows = (data.signals || []).map(s => {
     const sideClass = s.side === 'BUY' ? 'buy' : 'sell';
     const pnlC = s.pnl > 0 ? 'pos' : (s.pnl < 0 ? 'neg' : '');
-    const tag = s.forced ? ' ⚡' : (s.pullback ? ' ↩' : '');
+    const tag = s.forced ? ' ⚡' : (s.smc ? ' ◆' : (s.pullback ? ' ↩' : ''));
     const statusLabel = s.status === 'open' ? '<span class="badge neutral">Open</span>' : esc(s.result || '—');
     return `
       <tr>
@@ -2190,6 +1985,11 @@ function renderSignals(data){
       </tr>
     `;
   }).join('') || `<tr><td colspan="6" style="color:var(--text-faint);text-align:center;">No signals found in the scanned window</td></tr>`;
+
+  const setupLine = ['TREND','SMC','FORCED'].map(k => {
+    const b = bs[k] || {n:0,wins:0,net_pnl:0};
+    return `${k} ${b.wins}/${b.n} (${fmtMoney(b.net_pnl)})`;
+  }).join(' · ');
 
   document.getElementById('results').innerHTML = `
     <div class="panel">
@@ -2208,6 +2008,7 @@ function renderSignals(data){
           ${data.closed_trades} closed${data.still_open ? `, ${data.still_open} still open` : ''} ·
           best ${fmtMoney(data.best_trade)} · worst ${fmtMoney(data.worst_trade)}
         </p>
+        <p style="font-size:11.5px;color:var(--text-faint);margin-top:4px;">${setupLine}</p>
         <div class="section-label">Signal Log</div>
         <div class="scroll-x">
           <table>

@@ -154,7 +154,7 @@ SPREAD_PTS = _env_float("SPREAD_PTS", 0.0)
 # "ratchet"   = lock SL after TP1, close whole trade at TP2   (indicator default)
 # "tp1_only"  = full size closes at TP1
 # "first_hit" = full size closes at whichever TP is hit first
-PNL_MODE = os.environ.get("tp1_only", "ratchet")
+PNL_MODE = os.environ.get("tp1_only")
 
 MAX_LOSSES_PER_DAY = _env_int("MAX_LOSSES_PER_DAY", 2)   # 0 = unlimited
 COOLDOWN_BARS      = _env_int("COOLDOWN_BARS", 6)

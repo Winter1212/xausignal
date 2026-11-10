@@ -79,10 +79,10 @@ ENABLE_FORCE = _env_bool("ENABLE_FORCE", _env_bool("GUARANTEE_DAILY_TRADE", True
 DISABLE_WEEKEND_SIGNALS = _env_bool("DISABLE_WEEKEND_SIGNALS", True)
 
 USE_TRADING_HOURS    = _env_bool("USE_TRADING_HOURS", True)
-TRADING_START_HOUR   = _env_int("TRADING_START_HOUR", 6)
-TRADING_START_MINUTE = _env_int("TRADING_START_MINUTE", 30)
+TRADING_START_HOUR   = _env_int("TRADING_START_HOUR", 7)
+TRADING_START_MINUTE = _env_int("TRADING_START_MINUTE", 00)
 TRADING_END_HOUR     = _env_int("TRADING_END_HOUR", 23)
-TRADING_END_MINUTE   = _env_int("TRADING_END_MINUTE", 59)
+TRADING_END_MINUTE   = _env_int("TRADING_END_MINUTE", 00)
 
 USE_DAY_FILTER = _env_bool("USE_DAY_FILTER", True)
 TRADE_MON = _env_bool("TRADE_MON", False)
@@ -128,7 +128,7 @@ USE_SMC_GATE      = _env_bool("USE_SMC_GATE", True)
 GATE_MIN_SCORE    = _env_int("GATE_MIN_SCORE", 2)
 TRIG_MIN_SCORE    = _env_int("TRIG_MIN_SCORE", 3)
 SWING_LEN         = _env_int("SWING_LEN", 5)
-SWEEP_LOOKBACK    = _env_int("SWEEP_LOOKBACK", 8)
+SWEEP_LOOKBACK    = _env_int("SWEEP_LOOKBACK", 6)
 FVG_MIN_ATR       = _env_float("FVG_MIN_ATR", 0.3)
 ZONE_MAX_AGE      = _env_int("ZONE_MAX_AGE", 60)
 PD_LEN            = _env_int("PD_LEN", 60)
@@ -138,7 +138,7 @@ SL_BUFFER_PTS     = _env_float("SL_BUFFER_PTS", 1.0)
 USE_FLOW          = _env_bool("USE_FLOW", True)
 FLOW_LEN          = _env_int("FLOW_LEN", 10)
 REQUIRE_VOL_SPIKE = _env_bool("REQUIRE_VOL_SPIKE", False)
-VOL_MULT          = _env_float("VOL_MULT", 1.3)
+VOL_MULT          = _env_float("VOL_MULT", 0.5)
 
 # ---------------------- ENTRY TIMING ----------------------
 USE_PULLBACK_ENTRY    = _env_bool("USE_PULLBACK_ENTRY", True)
@@ -158,24 +158,24 @@ FORCE_SKIP_IF_NEVER_VALID = _env_bool("FORCE_SKIP_IF_NEVER_VALID", False)
 # ---------------------- RISK MANAGEMENT ----------------------
 ATR_LEN    = _env_int("ATR_LEN", 20)
 SL_MULT    = _env_float("SL_MULT", 1.5)
-SL_MIN_PTS = _env_float("SL_MIN_PTS", 8)
-SL_MAX_PTS = _env_float("SL_MAX_PTS", 20)
+SL_MIN_PTS = _env_float("SL_MIN_PTS", 10)
+SL_MAX_PTS = _env_float("SL_MAX_PTS", 10)
 RR1 = _env_float("RR1", 2.0)
-RR2 = _env_float("RR2", 4.5)
-LOCK_PTS   = _env_float("LOCK_PTS", 5.0)
-SPREAD_PTS = _env_float("SPREAD_PTS", 0.3)
+RR2 = _env_float("RR2", 3.0)
+LOCK_PTS   = _env_float("LOCK_PTS", 10)
+SPREAD_PTS = _env_float("SPREAD_PTS", 0)
 
 # "ratchet"   = lock SL after TP1, close whole trade at TP2   (indicator default)
 # "tp1_only"  = full size closes at TP1
 # "first_hit" = full size closes at whichever TP is hit first
 PNL_MODE = os.environ.get("PNL_MODE", "ratchet").strip().lower()
 if PNL_MODE not in ("ratchet", "tp1_only", "first_hit"):
-    PNL_MODE = "ratchet"
+    PNL_MODE = "tp1_only"
 
 MAX_LOSSES_PER_DAY = _env_int("MAX_LOSSES_PER_DAY", 2)   # 0 = unlimited
 COOLDOWN_BARS      = _env_int("COOLDOWN_BARS", 6)
 
-LOT_SIZE      = _env_float("LOT_SIZE", 0.05)
+LOT_SIZE      = _env_float("LOT_SIZE", 0.1)
 UNITS_PER_LOT = _env_float("UNITS_PER_LOT", 100)
 
 STATE_FILE = "state.json"

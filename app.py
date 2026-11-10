@@ -71,7 +71,7 @@ TIMEFRAME          = os.environ.get("TIMEFRAME", "5min")
 FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 
 # ---------------------- TRADE METHODS (ON/OFF) ----------------------
-ENABLE_TREND = _env_bool("ENABLE_TREND", True)
+ENABLE_TREND = _env_bool("ENABLE_TREND", False)
 ENABLE_SMC   = _env_bool("ENABLE_SMC",   _env_bool("USE_SMC_TRIGGER", True))
 ENABLE_FORCE = _env_bool("ENABLE_FORCE", _env_bool("GUARANTEE_DAILY_TRADE", True))
 

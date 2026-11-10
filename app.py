@@ -14,20 +14,31 @@ inject_ea_ui = register_ea_control(app)
 # =====================================================================
 #  SYNCED WITH "Gold Signal Terminal v2 — Trend + SMC + Flow Proxy"
 #  What changed vs the previous bot:
-#   - Defaults now equal the v2 indicator inputs (EMA 30/34, RSI 20,
-#     Supertrend 8/2.0, HTF 2h ATR 4 / factor 8, SL = ATR x1.5 clamped 8-20,
-#     RR 2.0 / 4.5, lock +5, spread 0.3, lot 0.05, trading end 23:59 ...).
-#   - Only TP1 / TP2 now (TP3/TP4 removed). Ratchet mode = lock SL at
-#     entry +/- LOCK_PTS after TP1, close the whole trade at TP2.
+#   - NEW: per-method ON/OFF switches ENABLE_TREND / ENABLE_SMC /
+#     ENABLE_FORCE (mirror the indicator's "Trade Methods" group).
+#     ENABLE_SMC falls back to the old USE_SMC_TRIGGER env var and
+#     ENABLE_FORCE to the old GUARANTEE_DAILY_TRADE env var, so existing
+#     Render settings keep working.
+#   - FIXED: PNL_MODE read os.environ.get("tp1_only") (an env var literally
+#     named "tp1_only"), so it was always None -> silently ratcheted.
+#     It now reads the PNL_MODE env var, default "ratchet".
+#   - FIXED: defaults that had drifted from the indicator are back in sync
+#     (trading hours 06:30-23:59, month-end pause 7d, sweep lookback 8,
+#     max extension 2.0, SL clamp 8-20 [was 10-10 so ATR did nothing],
+#     spread 0.3, lot 0.05). Override any of them with env vars.
+#   - Defaults equal the v2 indicator inputs (EMA 30/34, RSI 20,
+#     Supertrend 8/2.0, HTF 2h ATR 4 / factor 8, SL = ATR x1.5, RR 2.0 / 4.5,
+#     lock +5 ...).
+#   - Only TP1 / TP2. Ratchet mode = lock SL at entry +/- LOCK_PTS after
+#     TP1, close the whole trade at TP2.
 #   - Full SMC engine ported: swing pivots, BOS, liquidity sweeps, FVG,
 #     order blocks, premium/discount, tick-volume delta proxy -> 0-5 score.
 #   - Trend entries are gated by the SMC score; standalone SMC sweep
-#     entries added; SMC trades use structure SL (beyond sweep wick).
+#     entries; SMC trades use structure SL (beyond sweep wick).
 #   - Month-end pause, risk guard (max losses/day + cooldown bars).
 #   - Spread/cost deducted from every trade's points.
 #   - No exit on the entry bar; wins = pnl > 0.
 #   - HTF direction uses the PREVIOUS completed HTF candle ([1] in Pine).
-#   - Fixed: FORCE_REQUIRE_QUALITY_FILTERS was inverted (== "false").
 # =====================================================================
 
 
@@ -59,14 +70,19 @@ TIMEFRAME          = os.environ.get("TIMEFRAME", "5min")
 # are both Asia/Phnom_Penh by default).
 FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 
+# ---------------------- TRADE METHODS (ON/OFF) ----------------------
+ENABLE_TREND = _env_bool("ENABLE_TREND", True)
+ENABLE_SMC   = _env_bool("ENABLE_SMC",   _env_bool("USE_SMC_TRIGGER", True))
+ENABLE_FORCE = _env_bool("ENABLE_FORCE", _env_bool("GUARANTEE_DAILY_TRADE", True))
+
 # ---------------------- SESSION FILTERS ----------------------
 DISABLE_WEEKEND_SIGNALS = _env_bool("DISABLE_WEEKEND_SIGNALS", True)
 
 USE_TRADING_HOURS    = _env_bool("USE_TRADING_HOURS", True)
-TRADING_START_HOUR   = _env_int("TRADING_START_HOUR", 7)
-TRADING_START_MINUTE = _env_int("TRADING_START_MINUTE", 00)
-TRADING_END_HOUR     = _env_int("TRADING_END_HOUR", 22)
-TRADING_END_MINUTE   = _env_int("TRADING_END_MINUTE", 00)
+TRADING_START_HOUR   = _env_int("TRADING_START_HOUR", 6)
+TRADING_START_MINUTE = _env_int("TRADING_START_MINUTE", 30)
+TRADING_END_HOUR     = _env_int("TRADING_END_HOUR", 23)
+TRADING_END_MINUTE   = _env_int("TRADING_END_MINUTE", 59)
 
 USE_DAY_FILTER = _env_bool("USE_DAY_FILTER", True)
 TRADE_MON = _env_bool("TRADE_MON", False)
@@ -88,7 +104,7 @@ _DAY_LABEL_FLAGS = [
 ]
 
 USE_MONTH_END_PAUSE   = _env_bool("USE_MONTH_END_PAUSE", True)
-MONTH_END_PAUSE_DAYS  = _env_int("MONTH_END_PAUSE_DAYS", 3)
+MONTH_END_PAUSE_DAYS  = _env_int("MONTH_END_PAUSE_DAYS", 7)
 
 # ---------------------- SIGNAL ENGINE ----------------------
 FAST_LEN = _env_int("FAST_LEN", 30)
@@ -110,10 +126,9 @@ HTF_FACTOR     = _env_float("HTF_FACTOR", 8)
 # ---------------------- SMC ----------------------
 USE_SMC_GATE      = _env_bool("USE_SMC_GATE", True)
 GATE_MIN_SCORE    = _env_int("GATE_MIN_SCORE", 2)
-USE_SMC_TRIGGER   = _env_bool("USE_SMC_TRIGGER", True)
 TRIG_MIN_SCORE    = _env_int("TRIG_MIN_SCORE", 3)
 SWING_LEN         = _env_int("SWING_LEN", 5)
-SWEEP_LOOKBACK    = _env_int("SWEEP_LOOKBACK", 6)
+SWEEP_LOOKBACK    = _env_int("SWEEP_LOOKBACK", 8)
 FVG_MIN_ATR       = _env_float("FVG_MIN_ATR", 0.3)
 ZONE_MAX_AGE      = _env_int("ZONE_MAX_AGE", 60)
 PD_LEN            = _env_int("PD_LEN", 60)
@@ -130,10 +145,9 @@ USE_PULLBACK_ENTRY    = _env_bool("USE_PULLBACK_ENTRY", True)
 PULLBACK_MAX_ATR      = _env_float("PULLBACK_MAX_ATR", 1.2)
 PULLBACK_TIMEOUT_BARS = _env_int("PULLBACK_TIMEOUT_BARS", 4)
 USE_EXTENSION_FILTER  = _env_bool("USE_EXTENSION_FILTER", True)
-MAX_EXTENSION_ATR     = _env_float("MAX_EXTENSION_ATR", 2.5)
+MAX_EXTENSION_ATR     = _env_float("MAX_EXTENSION_ATR", 2.0)
 
-# ---------------------- DAILY TRADE GUARANTEE ----------------------
-GUARANTEE_DAILY_TRADE = _env_bool("GUARANTEE_DAILY_TRADE", True)
+# ---------------------- DAILY TRADE GUARANTEE (FORCED method settings) ----------------------
 FORCE_HOUR   = _env_int("FORCE_HOUR", 9)
 FORCE_MINUTE = _env_int("FORCE_MINUTE", 0)
 FORCE_REQUIRE_QUALITY_FILTERS = _env_bool("FORCE_REQUIRE_QUALITY_FILTERS", True)
@@ -144,22 +158,24 @@ FORCE_SKIP_IF_NEVER_VALID = _env_bool("FORCE_SKIP_IF_NEVER_VALID", False)
 # ---------------------- RISK MANAGEMENT ----------------------
 ATR_LEN    = _env_int("ATR_LEN", 20)
 SL_MULT    = _env_float("SL_MULT", 1.5)
-SL_MIN_PTS = _env_float("SL_MIN_PTS", 10)
-SL_MAX_PTS = _env_float("SL_MAX_PTS", 10)
+SL_MIN_PTS = _env_float("SL_MIN_PTS", 8)
+SL_MAX_PTS = _env_float("SL_MAX_PTS", 20)
 RR1 = _env_float("RR1", 2.0)
 RR2 = _env_float("RR2", 4.5)
 LOCK_PTS   = _env_float("LOCK_PTS", 5.0)
-SPREAD_PTS = _env_float("SPREAD_PTS", 0.0)
+SPREAD_PTS = _env_float("SPREAD_PTS", 0.3)
 
 # "ratchet"   = lock SL after TP1, close whole trade at TP2   (indicator default)
 # "tp1_only"  = full size closes at TP1
 # "first_hit" = full size closes at whichever TP is hit first
-PNL_MODE = os.environ.get("tp1_only")
+PNL_MODE = os.environ.get("PNL_MODE", "ratchet").strip().lower()
+if PNL_MODE not in ("ratchet", "tp1_only", "first_hit"):
+    PNL_MODE = "ratchet"
 
 MAX_LOSSES_PER_DAY = _env_int("MAX_LOSSES_PER_DAY", 2)   # 0 = unlimited
 COOLDOWN_BARS      = _env_int("COOLDOWN_BARS", 6)
 
-LOT_SIZE      = _env_float("LOT_SIZE", 0.1)
+LOT_SIZE      = _env_float("LOT_SIZE", 0.05)
 UNITS_PER_LOT = _env_float("UNITS_PER_LOT", 100)
 
 STATE_FILE = "state.json"
@@ -670,6 +686,11 @@ def _fmt_money(v):
     return f"{'+' if v >= 0 else ''}{v:.2f}"
 
 
+def _methods_text():
+    return (f"Trend {'ON' if ENABLE_TREND else 'OFF'} | SMC {'ON' if ENABLE_SMC else 'OFF'} | "
+            f"Forced {'ON' if ENABLE_FORCE else 'OFF'}")
+
+
 def build_check_telegram_message(result, state):
     lines = ["📊 [Manual Check] XAUUSD", f"Bar: {result.get('bar_time')} ({FORCE_TIMEZONE})"]
     event = result.get("event")
@@ -691,6 +712,7 @@ def build_check_telegram_message(result, state):
             lines.append(f"Result: no new signal on this bar. Pending {'LONG' if pending == 1 else 'SHORT'} signal armed, waiting for pullback.")
         else:
             lines.append("Result: no new signal on this bar.")
+    lines.append(f"Methods: {_methods_text()}")
 
     pos = state.get("position")
     if pos:
@@ -716,6 +738,7 @@ def build_stats_telegram_message(payload, state):
         f"Trend {ss.get('trend_w', 0)}/{ss.get('trend_n', 0)} | SMC {ss.get('smc_w', 0)}/{ss.get('smc_n', 0)} | "
         f"Forced {ss.get('forced_w', 0)}/{ss.get('forced_n', 0)}"
     )
+    lines.append(f"Methods: {_methods_text()}")
     pos = payload.get("position")
     if pos:
         side = "BUY" if pos["dir"] == 1 else "SELL"
@@ -886,7 +909,7 @@ def roll_daily_guarantee_state(state, bar_dt):
 
 def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_last,
                         rsi_val, extension_atr, risk_ok):
-    if not GUARANTEE_DAILY_TRADE:
+    if not ENABLE_FORCE:
         return False, 0
 
     if st_dir in (1, -1):
@@ -962,6 +985,7 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
     Evaluate bar i (a CLOSED bar) the way the indicator does. The caller must
     only call this when flat. Returns (entry_dict_or_None, info_dict).
     df needs: emaFast, emaSlow, rsi, atr, st_dir, bars_since_flip, htf_st_dir.
+    Each method (TREND / SMC / FORCED) is gated by its ENABLE_* switch.
     """
     bar = df.iloc[i]
     prev = df.iloc[i - 1]
@@ -1014,18 +1038,20 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
     else:
         trend_long_core, trend_short_core = base_long_cond, base_short_cond
 
-    long_cond = extension_ok and risk_ok and gate_long and trend_long_core
-    short_cond = extension_ok and risk_ok and gate_short and trend_short_core
+    # TREND method (EMA-cross), gated by the SMC score
+    long_cond = ENABLE_TREND and extension_ok and risk_ok and gate_long and trend_long_core
+    short_cond = ENABLE_TREND and extension_ok and risk_ok and gate_short and trend_short_core
 
-    # standalone SMC setup: sweep -> confirmation candle
+    # SMC method: standalone sweep -> confirmation candle
     bull_confirm = close_ > open_ and close_ > prev["close"]
     bear_confirm = close_ < open_ and close_ < prev["close"]
     vol_ok = (not REQUIRE_VOL_SPIKE) or smc["vol_spike"]
-    smc_long = (USE_SMC_TRIGGER and risk_ok and smc["recent_sweep_low"] and bull_confirm and htf_bullish
+    smc_long = (ENABLE_SMC and risk_ok and smc["recent_sweep_low"] and bull_confirm and htf_bullish
                 and rsi_ok_long and vol_ok and smc["score_long"] >= TRIG_MIN_SCORE)
-    smc_short = (USE_SMC_TRIGGER and risk_ok and smc["recent_sweep_high"] and bear_confirm and htf_bearish
+    smc_short = (ENABLE_SMC and risk_ok and smc["recent_sweep_high"] and bear_confirm and htf_bearish
                  and rsi_ok_short and vol_ok and smc["score_short"] >= TRIG_MIN_SCORE)
 
+    # FORCED method (returns False when ENABLE_FORCE is off)
     force_entry_now, force_direction = compute_force_entry(
         state, bar_dt, int(bar["st_dir"]), h_dir, bar["emaFast"], bar["emaSlow"],
         bar["rsi"], extension_atr, risk_ok,
@@ -1080,9 +1106,10 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
 # ---------------------- SIGNAL-COUNT BACKTEST (last N signals) ----------------------
 def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
     """
-    Replays the bot's own logic (Trend / SMC / Forced) on closed bars only,
-    with the same HTF handling, spread, cooldown, loss cap and SMC engine as
-    live, until `target_count` signals are found.
+    Replays the bot's own logic (Trend / SMC / Forced, honouring the ENABLE_*
+    switches) on closed bars only, with the same HTF handling, spread,
+    cooldown, loss cap and SMC engine as live, until `target_count` signals
+    are found.
     """
     headers = _capital_session_headers()
     days = initial_days
@@ -1320,6 +1347,7 @@ def check():
 
     state = load_state()
     result["position"] = state.get("position")
+    result["trade_methods"] = {"trend": ENABLE_TREND, "smc": ENABLE_SMC, "forced": ENABLE_FORCE}
 
     if _notify_requested():
         send_telegram(build_check_telegram_message(result, state))
@@ -1343,9 +1371,10 @@ def stats():
         "best_trade": s["best_trade"], "worst_trade": s["worst_trade"],
         "setup_stats": {k: s.get(k, 0) for k in
                         ("trend_n", "trend_w", "smc_n", "smc_w", "forced_n", "forced_w")},
+        "trade_methods": {"trend": ENABLE_TREND, "smc": ENABLE_SMC, "forced": ENABLE_FORCE},
         "recent_log": state["history"][:10],
         "daily_guarantee": {
-            "enabled": GUARANTEE_DAILY_TRADE,
+            "enabled": ENABLE_FORCE,
             "force_hour": FORCE_HOUR, "force_minute": FORCE_MINUTE,
             "force_timezone": FORCE_TIMEZONE,
             "current_day": state.get("current_day"),
@@ -1401,7 +1430,8 @@ def signals_history():
             f"Win rate: {result['win_rate']}% ({result['wins']}W / {result['losses']}L)\n"
             f"Net P&L: {'+' if result['net_pnl'] >= 0 else '-'}${abs(result['net_pnl']):.2f}\n"
             f"Trend {bs['TREND']['wins']}/{bs['TREND']['n']} | SMC {bs['SMC']['wins']}/{bs['SMC']['n']} | "
-            f"Forced {bs['FORCED']['wins']}/{bs['FORCED']['n']}"
+            f"Forced {bs['FORCED']['wins']}/{bs['FORCED']['n']}\n"
+            f"Methods: {_methods_text()}"
         )
         send_telegram(msg)
         result["telegram_notified"] = True
@@ -1461,6 +1491,7 @@ def health():
         "symbol": SYMBOL,
         "timeframe": TIMEFRAME,
         "signals_evaluated_on": "last closed bar",
+        "trade_methods": {"trend": ENABLE_TREND, "smc": ENABLE_SMC, "forced": ENABLE_FORCE},
         "supertrend": f"ATR {ST_ATR_PERIOD} / factor {ST_FACTOR}",
         "rsi": f"len {RSI_LEN}, block buys > {RSI_OB}, block sells < {RSI_OS}",
         "ema": f"{FAST_LEN}/{SLOW_LEN}",
@@ -1469,7 +1500,7 @@ def health():
         "st_confirm_bars": ST_CONFIRM_BARS,
         "smc": {
             "gate": USE_SMC_GATE, "gate_min_score": GATE_MIN_SCORE,
-            "trigger": USE_SMC_TRIGGER, "trigger_min_score": TRIG_MIN_SCORE,
+            "trigger": ENABLE_SMC, "trigger_min_score": TRIG_MIN_SCORE,
             "swing_len": SWING_LEN, "sweep_lookback": SWEEP_LOOKBACK,
             "structure_sl": USE_STRUCTURE_SL, "flow_proxy": USE_FLOW,
         },
@@ -1482,7 +1513,7 @@ def health():
                  "rr1": RR1, "rr2": RR2, "lock_pts": LOCK_PTS, "spread_pts": SPREAD_PTS,
                  "lot": LOT_SIZE, "pnl_mode": PNL_MODE},
         "risk_guard": {"max_losses_per_day": MAX_LOSSES_PER_DAY, "cooldown_bars": COOLDOWN_BARS},
-        "guarantee_daily_trade": GUARANTEE_DAILY_TRADE,
+        "guarantee_daily_trade": ENABLE_FORCE,
         "force": f"{FORCE_HOUR:02d}:{FORCE_MINUTE:02d} {FORCE_TIMEZONE}, hard {FORCE_HARD_HOUR:02d}:{FORCE_HARD_MINUTE:02d}",
         "force_require_quality_filters": FORCE_REQUIRE_QUALITY_FILTERS,
         "force_skip_if_never_valid": FORCE_SKIP_IF_NEVER_VALID,
@@ -1819,6 +1850,17 @@ function eventBadge(event, weekendSkipped, hoursSkipped, daySkipped, monthSkippe
   return `<span class="badge muted">No Signal</span>`;
 }
 
+function methodsKv(m){
+  if(!m) return '';
+  const on = v => v ? 'ON' : 'OFF';
+  return `
+    <div class="section-label">Trade Methods</div>
+    <div class="kv"><span class="k">Trend (EMA-cross)</span><span class="v">${on(m.trend)}</span></div>
+    <div class="kv"><span class="k">SMC (Sweep)</span><span class="v">${on(m.smc)}</span></div>
+    <div class="kv"><span class="k">Forced daily</span><span class="v">${on(m.forced)}</span></div>
+  `;
+}
+
 function positionKv(pos){
   if(!pos) return `<div class="kv"><span class="k">Open position</span><span class="v">None</span></div>`;
   const side = pos.dir === 1 ? 'BUY' : 'SELL';
@@ -1883,6 +1925,7 @@ function renderCheck(data){
         ${sessionBlock}
         ${pendingBlock}
         ${smcBlock}
+        ${methodsKv(data.trade_methods)}
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}
       </div>
@@ -1928,6 +1971,8 @@ function renderStats(data){
           <div class="stat-box"><div class="k">Net P&amp;L</div><div class="v ${pnlClass}">${fmtMoney(data.net_pnl)}</div></div>
           <div class="stat-box"><div class="k">Total Trades</div><div class="v">${data.total_trades}</div></div>
         </div>
+
+        ${methodsKv(data.trade_methods)}
 
         <div class="section-label">By Setup (wins / trades)</div>
         <div class="kv"><span class="k">Trend</span><span class="v">${ss.trend_w || 0} / ${ss.trend_n || 0}</span></div>

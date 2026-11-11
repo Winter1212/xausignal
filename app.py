@@ -104,7 +104,7 @@ _DAY_LABEL_FLAGS = [
 ]
 
 USE_MONTH_END_PAUSE   = _env_bool("USE_MONTH_END_PAUSE", True)
-MONTH_END_PAUSE_DAYS  = _env_int("MONTH_END_PAUSE_DAYS", 7)
+MONTH_END_PAUSE_DAYS  = _env_int("MONTH_END_PAUSE_DAYS", 1)
 
 # ---------------------- SIGNAL ENGINE ----------------------
 FAST_LEN = _env_int("FAST_LEN", 30)

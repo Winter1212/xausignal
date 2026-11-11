@@ -125,7 +125,7 @@ HTF_FACTOR     = _env_float("HTF_FACTOR", 8)
 
 # ---------------------- SMC ----------------------
 USE_SMC_GATE      = _env_bool("USE_SMC_GATE", True)
-GATE_MIN_SCORE    = _env_int("GATE_MIN_SCORE", 2)
+GATE_MIN_SCORE    = _env_int("GATE_MIN_SCORE", 3)
 TRIG_MIN_SCORE    = _env_int("TRIG_MIN_SCORE", 3)
 SWING_LEN         = _env_int("SWING_LEN", 7)
 SWEEP_LOOKBACK    = _env_int("SWEEP_LOOKBACK", 6)
@@ -137,8 +137,8 @@ SL_BUFFER_PTS     = _env_float("SL_BUFFER_PTS", 1.0)
 
 USE_FLOW          = _env_bool("USE_FLOW", True)
 FLOW_LEN          = _env_int("FLOW_LEN", 10)
-REQUIRE_VOL_SPIKE = _env_bool("REQUIRE_VOL_SPIKE", False)
-VOL_MULT          = _env_float("VOL_MULT", 0.5)
+REQUIRE_VOL_SPIKE = _env_bool("REQUIRE_VOL_SPIKE", True)
+VOL_MULT          = _env_float("VOL_MULT", 0.8)
 
 # ---------------------- ENTRY TIMING ----------------------
 USE_PULLBACK_ENTRY    = _env_bool("USE_PULLBACK_ENTRY", True)

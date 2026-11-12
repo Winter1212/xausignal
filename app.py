@@ -136,9 +136,9 @@ USE_STRUCTURE_SL  = _env_bool("USE_STRUCTURE_SL", True)
 SL_BUFFER_PTS     = _env_float("SL_BUFFER_PTS", 1.0)
 
 USE_FLOW          = _env_bool("USE_FLOW", True)
-FLOW_LEN          = _env_int("FLOW_LEN", 10)
+FLOW_LEN          = _env_int("FLOW_LEN", 1.5)
 REQUIRE_VOL_SPIKE = _env_bool("REQUIRE_VOL_SPIKE", True)
-VOL_MULT          = _env_float("VOL_MULT", 0.8)
+VOL_MULT          = _env_float("VOL_MULT", 1.5)
 
 # ---------------------- ENTRY TIMING ----------------------
 USE_PULLBACK_ENTRY    = _env_bool("USE_PULLBACK_ENTRY", True)

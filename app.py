@@ -169,7 +169,7 @@ SPREAD_PTS = _env_float("SPREAD_PTS", 0)
 # "tp1_only"  = full size closes at TP1
 # "first_hit" = full size closes at whichever TP is hit first
 PNL_MODE = os.environ.get("PNL_MODE", "ratchet").strip().lower()
-if PNL_MODE not in ("ratchet", "tp1_only", "first_hit"):
+if PNL_MODE not in ("tp1_only"):
     PNL_MODE = "tp1_only"
 
 MAX_LOSSES_PER_DAY = _env_int("MAX_LOSSES_PER_DAY", 2)   # 0 = unlimited

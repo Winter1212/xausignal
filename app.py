@@ -1,7 +1,9 @@
 import os
 import json
 import math
+import time
 import calendar
+import threading
 import numpy as np
 import requests
 import pandas as pd
@@ -13,22 +15,26 @@ inject_ea_ui = register_ea_control(app)
 
 # =====================================================================
 #  SYNCED WITH "Gold Signal Terminal v2.1 — Trend + SMC + Flow Proxy"
-#  (all default VALUES are unchanged from the previous bot)
 #
-#  v2.1 sync:
-#   - NEW: SMC_AFTER_FORCE (default true). SMC trades are locked until the
-#     FORCED daily trade has fired AND closed (SL/TP) today, and are locked
-#     before the force time. Only sweeps formed AFTER the unlock can trigger
-#     an SMC entry (older sweeps are ignored). The SMC score used by the
-#     Trend gate is not affected.
-#   - Auto-unlock (after the force time) when: forced disabled / forced
-#     skipped as "never valid" / a Trend trade pre-empted the forced trade
-#     and has closed.
-#   - A forced trade that closes on a later calendar day than it was entered
-#     does NOT unlock the new day's SMC (same as the indicator).
-#   - FIXED: PNL_MODE validation was `not in ("tp1_only")` (a substring test),
-#     which forced every mode to tp1_only. Now valid modes are
-#     ratchet / tp1_only / first_hit; anything else falls back to ratchet.
+#  v2.2 changes (execution / timing):
+#   - PNL_MODE now defaults to "tp1_only": the WHOLE trade closes at TP1.
+#     TP1 is a fixed TP1_PTS (default 20 points) from entry. Set TP1_PTS=0
+#     to go back to SL x RR1.
+#   - ENTRY_MODE (default "live"): the entry in the alert is the CURRENT
+#     ask (BUY) / bid (SELL) at the moment the alert is sent, and SL/TP are
+#     rebuilt from that price (same point distances). The bot's open position
+#     uses the same price, so your entry and the bot's entry match.
+#     ENTRY_MODE=signal_close keeps the old behaviour (close of the signal bar).
+#   - The alert shows SL/TP in POINTS too, a max-chase price, how many
+#     seconds after the candle close it was sent, and how far the live price
+#     is from the signal candle close.
+#   - AUTO_CHECK (default true): a background scheduler runs /check a few
+#     seconds after every candle close (retries until the new closed candle is
+#     available), so the alert no longer waits for an external cron.
+#     Keep your cron as a backup / keep-alive. Run gunicorn with ONE worker.
+#   - One Capital.com session is reused for all requests inside /check.
+#   - A lock stops two /check calls (cron + scheduler) from running at once.
+#   - All other default VALUES are unchanged.
 # =====================================================================
 
 
@@ -157,12 +163,16 @@ RR2 = _env_float("RR2", 3.0)
 LOCK_PTS   = _env_float("LOCK_PTS", 10)
 SPREAD_PTS = _env_float("SPREAD_PTS", 0)
 
-# "ratchet"   = lock SL after TP1, close whole trade at TP2   (indicator default)
-# "tp1_only"  = full size closes at TP1
+# Fixed take-profit distance (price points). The whole trade closes here when
+# PNL_MODE = "tp1_only". 0 = use SL distance x RR1 instead.
+TP1_PTS = _env_float("TP1_PTS", 20)
+
+# "tp1_only"  = full size closes at TP1   (DEFAULT - TP1 = TP1_PTS points)
+# "ratchet"   = lock SL after TP1, close whole trade at TP2
 # "first_hit" = full size closes at whichever TP is hit first
-PNL_MODE = os.environ.get("PNL_MODE", "ratchet").strip().lower()
+PNL_MODE = os.environ.get("PNL_MODE", "tp1_only").strip().lower()
 if PNL_MODE not in ("ratchet", "tp1_only", "first_hit"):
-    PNL_MODE = "ratchet"
+    PNL_MODE = "tp1_only"
 
 MAX_LOSSES_PER_DAY = _env_int("MAX_LOSSES_PER_DAY", 2)   # 0 = unlimited
 COOLDOWN_BARS      = _env_int("COOLDOWN_BARS", 6)
@@ -170,7 +180,24 @@ COOLDOWN_BARS      = _env_int("COOLDOWN_BARS", 6)
 LOT_SIZE      = _env_float("LOT_SIZE", 0.1)
 UNITS_PER_LOT = _env_float("UNITS_PER_LOT", 100)
 
+# ---------------------- ENTRY PRICE / ALERT TIMING ----------------------
+# "live"         = current ask (BUY) / bid (SELL) when the alert is sent
+# "signal_close" = close of the signal candle (old behaviour)
+ENTRY_MODE = os.environ.get("ENTRY_MODE", "live").strip().lower()
+if ENTRY_MODE not in ("live", "signal_close"):
+    ENTRY_MODE = "live"
+
+# Shown in the alert: do not chase the trade if price is already this many
+# points past the alert entry (0 = hide the line)
+MAX_CHASE_PTS = _env_float("MAX_CHASE_PTS", 2.0)
+
+# Background scheduler: run /check a few seconds after every candle close
+AUTO_CHECK           = _env_bool("AUTO_CHECK", True)
+AUTO_CHECK_DELAY_SEC = _env_float("AUTO_CHECK_DELAY_SEC", 3)
+AUTO_CHECK_RETRIES   = _env_int("AUTO_CHECK_RETRIES", 6)
+
 STATE_FILE = "state.json"
+_CHECK_LOCK = threading.Lock()
 
 # ---------------------- CAPITAL.COM DATA FETCHING ----------------------
 _CAPITAL_RESOLUTION_MAP = {
@@ -226,6 +253,7 @@ def _capital_prices_to_df(payload):
         rows.append({
             "datetime": p["snapshotTimeUTC"],
             "open": o["bid"], "high": h["bid"], "low": l["bid"], "close": c["bid"],
+            "close_ask": c.get("ask", c["bid"]),   # used for BUY entries (you buy at the ask)
             "volume": p.get("lastTradedVolume", 0) or 0,
         })
     df = pd.DataFrame(rows)
@@ -258,17 +286,33 @@ def _resample_candles(df, hours):
     return agg.reset_index()[["datetime", "open", "high", "low", "close", "volume"]]
 
 
-def fetch_candles(interval, outputsize=500):
+def fetch_candles(interval, outputsize=500, session_headers=None):
     if interval in _RESAMPLE_FROM:
         base_interval, factor = _RESAMPLE_FROM[interval]
-        base_df = fetch_candles(base_interval, outputsize=min(outputsize * factor, 1000))
+        base_df = fetch_candles(base_interval, outputsize=min(outputsize * factor, 1000),
+                                session_headers=session_headers)
         return _resample_candles(base_df, factor)
-    headers = _capital_session_headers()
+    headers = session_headers or _capital_session_headers()
     params = {"resolution": _capital_resolution(interval), "max": min(outputsize, 1000)}
     r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/prices/{SYMBOL}", headers=headers, params=params, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"Capital.com prices error ({r.status_code}): {r.text}")
     return _capital_prices_to_df(r.json())
+
+
+def fetch_live_quote(headers):
+    """Latest (bid, ask) from the Capital.com market snapshot, or None if it
+    cannot be read (the caller then falls back to the forming candle)."""
+    try:
+        r = requests.get(f"{CAPITAL_BASE_URL}/api/v1/markets/{SYMBOL}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            snap = r.json().get("snapshot", {}) or {}
+            bid, ask = snap.get("bid"), snap.get("offer")
+            if bid and ask:
+                return float(bid), float(ask)
+    except Exception as e:
+        print("live quote error:", e)
+    return None
 
 
 def fetch_candles_range(interval, start_date, end_date, session_headers=None):
@@ -689,6 +733,45 @@ def _methods_text():
             f"Forced {'ON' if ENABLE_FORCE else 'OFF'}")
 
 
+def build_entry_message(entry, smc, bar_time, delay_sec, tag, htf_line):
+    """The Telegram alert for a new entry."""
+    side = entry["side"]
+    sgn = 1 if side == "BUY" else -1
+    lines = [f"XAUUSD {side} signal {tag}"]
+
+    if ENTRY_MODE == "live":
+        px_name = "ask" if side == "BUY" else "bid"
+        lines.append(f"ENTER NOW @ {entry['entry']:.2f} ({px_name})")
+    else:
+        lines.append(f"Entry: {entry['entry']:.2f}")
+
+    lines.append(f"SL: {entry['sl']:.2f}  ({entry['sl_dist']:.1f} pts)")
+    if PNL_MODE == "tp1_only":
+        lines.append(f"TP: {entry['tp1']:.2f}  ({entry['tp1_dist']:.1f} pts, full close)")
+    else:
+        lines.append(f"TP1: {entry['tp1']:.2f}  ({entry['tp1_dist']:.1f} pts)")
+        lines.append(f"TP2: {entry['tp2']:.2f}  ({entry['tp2_dist']:.1f} pts)")
+
+    if ENTRY_MODE == "live" and MAX_CHASE_PTS > 0:
+        worst = entry["entry"] + sgn * MAX_CHASE_PTS
+        way = "above" if side == "BUY" else "below"
+        lines.append(f"Max chase: {worst:.2f} (skip if price is already {way} this)")
+    lines.append("Tip: set SL/TP as POINTS from your own fill price.")
+
+    if "signal_close" in entry:
+        slip = (entry["entry"] - entry["signal_close"]) * sgn
+        lines.append(f"Signal candle close: {entry['signal_close']:.2f} | live vs close: {slip:+.2f} pts")
+    if delay_sec is not None:
+        lines.append(f"Sent {delay_sec:.0f}s after candle close")
+
+    lines.append(f"Supertrend ({TIMEFRAME}): {trend_arrow(entry['st_dir'])}")
+    if htf_line:
+        lines.append(htf_line.strip())
+    lines.append(f"SMC score L/S: {smc['score_long']} / {smc['score_short']}")
+    lines.append(f"Bar: {bar_time} ({FORCE_TIMEZONE})")
+    return "\n".join(lines)
+
+
 def build_check_telegram_message(result, state):
     lines = ["📊 [Manual Check] XAUUSD", f"Bar: {result.get('bar_time')} ({FORCE_TIMEZONE})"]
     event = result.get("event")
@@ -718,9 +801,13 @@ def build_check_telegram_message(result, state):
     pos = state.get("position")
     if pos:
         side = "BUY" if pos["dir"] == 1 else "SELL"
+        if PNL_MODE == "tp1_only":
+            tp_txt = f"TP {_fmt_price(pos['tp1'])}"
+        else:
+            tp_txt = f"TP1 {_fmt_price(pos['tp1'])} TP2 {_fmt_price(pos['tp2'])}"
         lines.append(
             f"Open position: {side} ({pos.get('setup', '')}) @ {_fmt_price(pos['entry'])} | "
-            f"SL {_fmt_price(pos['sl'])} | TP1 {_fmt_price(pos['tp1'])} TP2 {_fmt_price(pos['tp2'])}"
+            f"SL {_fmt_price(pos['sl'])} | {tp_txt}"
         )
     else:
         lines.append("No open position.")
@@ -816,18 +903,21 @@ def settle_trade(state, pos, exit_price, result_label, bar_time):
     return pnl
 
 
-def open_position(e, bar_time):
+def open_position(e, entry_time):
     return {
         "dir": 1 if e["side"] == "BUY" else -1,
         "entry": e["entry"], "sl": e["sl"], "tp1": e["tp1"], "tp2": e["tp2"],
         "tp3": None, "tp4": None,   # kept so the dashboard still renders
-        "setup": e["setup"], "entry_time": bar_time,
+        "setup": e["setup"], "entry_time": entry_time,
         "tp1_hit": False, "lock_bar": None, "remaining_size": 1.0,
     }
 
 
-def commit_entry(state, e, bar_time):
-    state["position"] = open_position(e, bar_time)
+def commit_entry(state, e, bar_time, entry_time=None):
+    """bar_time   = open time of the SIGNAL candle (used for the sweep-reset memory)
+       entry_time = candle the trade was actually opened in. Exits are only evaluated
+                    on candles AFTER it (defaults to bar_time)."""
+    state["position"] = open_position(e, entry_time or bar_time)
     state["traded_today"] = True
     state["force_attempted_today"] = True
     if e.get("setup") == "FORCED":
@@ -873,7 +963,7 @@ def manage_position(state, candle, silent=False):
         if hit_sl:
             close_(pos["sl"], "SL Hit")
         elif hit_tp1:
-            close_(pos["tp1"], "TP1 Hit (Full Close)")
+            close_(pos["tp1"], "TP Hit (Full Close)")
     elif PNL_MODE == "first_hit":
         if hit_sl:
             close_(pos["sl"], "SL Hit")
@@ -1038,6 +1128,28 @@ def roll_pullback_state(state, df, i, bar_time, st_bullish, st_bearish, htf_bull
             state["pending_bar_time"] = None
 
 
+# ---------------------- TAKE-PROFIT DISTANCES / LIVE ENTRY ----------------------
+def _tp_dists(risk):
+    """(tp1_distance, tp2_distance) in price points."""
+    tp1_d = TP1_PTS if TP1_PTS > 0 else risk * RR1
+    tp2_d = max(risk * RR2, tp1_d)
+    return float(tp1_d), float(tp2_d)
+
+
+def apply_live_entry(e, bid, ask):
+    """Re-base an entry onto the live price: BUY fills at the ask, SELL at the bid.
+    SL / TP keep the same point distances from the new entry."""
+    sgn = 1 if e["side"] == "BUY" else -1
+    px = float(ask if e["side"] == "BUY" else bid)
+    out = dict(e)
+    out["signal_close"] = float(e["entry"])
+    out["entry"] = px
+    out["sl"] = px - sgn * e["sl_dist"]
+    out["tp1"] = px + sgn * e["tp1_dist"]
+    out["tp2"] = px + sgn * e["tp2_dist"]
+    return out
+
+
 # ---------------------- ENTRY EVALUATION (shared by /check and the backtest) ----------------------
 def evaluate_entry(state, df, i, smc, bars_since_exit):
     """
@@ -1157,24 +1269,24 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
         is_forced = force_long and not long_cond and not smc_long
         if is_smc and USE_STRUCTURE_SL and _ok(smc["sweep_low_px"]):
             sl_dist = min(max(close_ - smc["sweep_low_px"] + SL_BUFFER_PTS, SL_MIN_PTS), SL_MAX_PTS)
-        sl = entry - sl_dist
-        risk = entry - sl
-        tp1, tp2 = entry + risk * RR1, entry + risk * RR2
-        side = "BUY"
+        side, sgn = "BUY", 1
     else:
         is_smc = smc_short and not short_cond
         is_forced = force_short and not short_cond and not smc_short
         if is_smc and USE_STRUCTURE_SL and _ok(smc["sweep_high_px"]):
             sl_dist = min(max(smc["sweep_high_px"] - close_ + SL_BUFFER_PTS, SL_MIN_PTS), SL_MAX_PTS)
-        sl = entry + sl_dist
-        risk = sl - entry
-        tp1, tp2 = entry - risk * RR1, entry - risk * RR2
-        side = "SELL"
+        side, sgn = "SELL", -1
+
+    tp1_dist, tp2_dist = _tp_dists(sl_dist)
+    sl = entry - sgn * sl_dist
+    tp1 = entry + sgn * tp1_dist
+    tp2 = entry + sgn * tp2_dist
 
     setup = "FORCED" if is_forced else "SMC" if is_smc else "TREND"
     entry_dict = {
         "side": side, "setup": setup, "entry": float(entry), "sl": float(sl),
         "tp1": float(tp1), "tp2": float(tp2),
+        "sl_dist": float(sl_dist), "tp1_dist": float(tp1_dist), "tp2_dist": float(tp2_dist),
         "forced": setup == "FORCED", "smc": setup == "SMC",
         "pullback": USE_PULLBACK_ENTRY and setup == "TREND",
         "htf_dir": h_dir, "st_dir": int(bar["st_dir"]),
@@ -1188,7 +1300,7 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
     Replays the bot's own logic (Trend / SMC / Forced, honouring the ENABLE_*
     switches and the SMC-after-Forced lock) on closed bars only, with the same
     HTF handling, spread, cooldown, loss cap and SMC engine as live, until
-    `target_count` signals are found.
+    `target_count` signals are found. (Entries use the signal candle close.)
     """
     headers = _capital_session_headers()
     days = initial_days
@@ -1300,12 +1412,12 @@ def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
 
 
 # ---------------------- CORE CHECK ----------------------
-@app.route("/check", methods=["GET"])
-def check():
+def _check_impl():
     if not (CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD) or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return jsonify({"error": "Missing required environment variables"}), 500
 
-    df = fetch_candles(TIMEFRAME, outputsize=1000)
+    headers = _capital_session_headers()          # one session reused for every request below
+    df = fetch_candles(TIMEFRAME, outputsize=1000, session_headers=headers)
     add_indicators(df)
 
     # Newest candle is still forming: NEW SIGNALS use the last CLOSED bar only;
@@ -1368,7 +1480,7 @@ def check():
 
         if flat_before_signal_bar and state["position"] is None:
             if USE_HTF:
-                htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=500)
+                htf_df = fetch_candles(HTF_TIMEFRAME, outputsize=500, session_headers=headers)
                 sig_df = attach_htf_direction(sig_df, htf_df)
             else:
                 sig_df["htf_st_dir"] = 0
@@ -1400,27 +1512,36 @@ def check():
                              "unlocked": info.get("smc_unlocked")}
 
             if entry:
-                commit_entry(state, entry, bar_time)
+                # how long after the signal candle closed are we?
+                bar_close_dt = last["datetime"] + pd.Timedelta(minutes=_INTERVAL_MINUTES.get(TIMEFRAME, 5))
+                now_local = pd.Timestamp.now(tz=FORCE_TIMEZONE).tz_localize(None)
+                delay_sec = max(0.0, (now_local - bar_close_dt).total_seconds())
+
+                entry_time_for_pos = bar_time
+                if ENTRY_MODE == "live":
+                    quote = fetch_live_quote(headers)
+                    if quote is None:   # fall back to the forming candle
+                        live_bid = float(live["close"])
+                        live_ask = float(live["close_ask"]) if "close_ask" in live.index else live_bid
+                        quote = (live_bid, live_ask)
+                    entry = apply_live_entry(entry, quote[0], quote[1])
+                    # the forming candle already contains price action from before our entry,
+                    # so only judge SL/TP from the NEXT candle on
+                    entry_time_for_pos = str(live["datetime"])
+
+                commit_entry(state, entry, bar_time, entry_time=entry_time_for_pos)
                 tag = {"FORCED": "(Forced Daily)", "SMC": "(SMC Sweep)"}.get(
                     entry["setup"], "(Trend, Pullback)" if entry["pullback"] else "(Trend)")
-                htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(entry['htf_dir'])}\n" if USE_HTF else ""
-                msg = (
-                    f"XAUUSD {entry['side']} signal {tag}\n"
-                    f"Entry: {entry['entry']:.2f}\n"
-                    f"SL: {entry['sl']:.2f}\n"
-                    f"TP1: {entry['tp1']:.2f}\n"
-                    f"TP2: {entry['tp2']:.2f}\n"
-                    f"Supertrend ({TIMEFRAME}): {trend_arrow(entry['st_dir'])}\n"
-                    f"{htf_line}"
-                    f"SMC score L/S: {smc['score_long']} / {smc['score_short']}\n"
-                    f"Bar: {bar_time} ({FORCE_TIMEZONE})"
-                )
+                htf_line = f"HTF Supertrend ({HTF_TIMEFRAME}): {trend_arrow(entry['htf_dir'])}" if USE_HTF else ""
+                msg = build_entry_message(entry, smc, bar_time, delay_sec, tag, htf_line)
                 send_telegram(msg)
                 result.update({
                     "event": "entry", "side": entry["side"], "setup": entry["setup"],
                     "forced": entry["forced"], "smc_entry": entry["smc"], "pullback": entry["pullback"],
                     "message": msg, "entry": entry["entry"], "sl": entry["sl"],
                     "tp1": entry["tp1"], "tp2": entry["tp2"],
+                    "signal_close": entry.get("signal_close"), "delay_sec": round(delay_sec, 1),
+                    "entry_mode": ENTRY_MODE,
                 })
 
         save_state(state)
@@ -1435,6 +1556,13 @@ def check():
         result["telegram_notified"] = True
 
     return jsonify(result)
+
+
+@app.route("/check", methods=["GET"])
+def check():
+    # one /check at a time (cron + background scheduler must not overlap)
+    with _CHECK_LOCK:
+        return _check_impl()
 
 
 @app.route("/stats", methods=["GET"])
@@ -1536,11 +1664,15 @@ def test_signal():
     entry = last["close"]
     sl_dist = min(max(last["atr"] * SL_MULT, SL_MIN_PTS), SL_MAX_PTS)
     sl = entry - sl_dist
-    risk = entry - sl
+    tp1_dist, tp2_dist = _tp_dists(sl_dist)
+    if PNL_MODE == "tp1_only":
+        tp_txt = f"TP: {entry + tp1_dist:.2f}"
+    else:
+        tp_txt = f"TP1: {entry + tp1_dist:.2f}\nTP2: {entry + tp2_dist:.2f}"
     msg = (
         f"[TEST] XAUUSD BUY signal (Trend)\n"
         f"Entry: {entry:.2f}\nSL: {sl:.2f}\n"
-        f"TP1: {entry + risk * RR1:.2f}\nTP2: {entry + risk * RR2:.2f}\n"
+        f"{tp_txt}\n"
         f"Bar: {last['datetime']} ({FORCE_TIMEZONE})\n"
         f"(This is a forced test message, not a real signal)"
     )
@@ -1559,11 +1691,13 @@ def capital_status():
             headers=headers, params={"resolution": "MINUTE", "max": 1}, timeout=15,
         )
         symbol_available = r.status_code == 200 and bool(r.json().get("prices"))
+        quote = fetch_live_quote(headers)
     except Exception as e:
         return jsonify({"configured": True, "connected": False, "error": str(e)}), 500
     return jsonify({
         "configured": True, "connected": True, "base_url": CAPITAL_BASE_URL,
         "symbol": SYMBOL, "symbol_available": symbol_available,
+        "live_quote": {"bid": quote[0], "ask": quote[1]} if quote else None,
     })
 
 
@@ -1598,8 +1732,10 @@ def health():
         "use_extension_filter": USE_EXTENSION_FILTER,
         "max_extension_atr": MAX_EXTENSION_ATR,
         "risk": {"sl_mult": SL_MULT, "sl_min": SL_MIN_PTS, "sl_max": SL_MAX_PTS,
-                 "rr1": RR1, "rr2": RR2, "lock_pts": LOCK_PTS, "spread_pts": SPREAD_PTS,
-                 "lot": LOT_SIZE, "pnl_mode": PNL_MODE},
+                 "rr1": RR1, "rr2": RR2, "tp1_pts": TP1_PTS, "lock_pts": LOCK_PTS,
+                 "spread_pts": SPREAD_PTS, "lot": LOT_SIZE, "pnl_mode": PNL_MODE},
+        "execution": {"entry_mode": ENTRY_MODE, "max_chase_pts": MAX_CHASE_PTS,
+                      "auto_check": AUTO_CHECK, "auto_check_delay_sec": AUTO_CHECK_DELAY_SEC},
         "risk_guard": {"max_losses_per_day": MAX_LOSSES_PER_DAY, "cooldown_bars": COOLDOWN_BARS},
         "guarantee_daily_trade": ENABLE_FORCE,
         "force": f"{FORCE_HOUR:02d}:{FORCE_MINUTE:02d} {FORCE_TIMEZONE}, hard {FORCE_HARD_HOUR:02d}:{FORCE_HARD_MINUTE:02d}",
@@ -2167,6 +2303,53 @@ function renderSignals(data){
 </body>
 </html>
 """
+
+
+# ---------------------- BACKGROUND SCHEDULER (runs /check right after each candle close) ----------------------
+def _expected_closed_bar_time(boundary_epoch, step_sec):
+    """Open time (FORCE_TIMEZONE, naive, as str) of the candle that closed at boundary_epoch."""
+    ts = pd.Timestamp(boundary_epoch - step_sec, unit="s", tz="UTC").tz_convert(FORCE_TIMEZONE).tz_localize(None)
+    return str(ts)
+
+
+def _run_check_once():
+    """Call the /check logic in-process (same lock as the HTTP route)."""
+    with app.test_request_context("/check"):
+        out = check()
+    resp = out[0] if isinstance(out, tuple) else out
+    return resp.get_json(silent=True) or {}
+
+
+def _scheduler_loop():
+    step = _INTERVAL_MINUTES.get(TIMEFRAME, 5) * 60
+    print(f"[auto-check] started: every {step // 60} min, +{AUTO_CHECK_DELAY_SEC}s after candle close")
+    while True:
+        now = time.time()
+        boundary = (math.floor(now / step) + 1) * step
+        time.sleep(max(0.2, boundary + AUTO_CHECK_DELAY_SEC - time.time()))
+        want = _expected_closed_bar_time(boundary, step)
+        for _attempt in range(AUTO_CHECK_RETRIES + 1):
+            try:
+                data = _run_check_once()
+                if data.get("bar_time") == want:
+                    break                      # the new closed candle was processed
+            except Exception as e:
+                print("[auto-check] error:", e)
+            time.sleep(2)                      # candle not available yet -> retry shortly
+
+
+_scheduler_started = False
+
+
+def start_scheduler():
+    global _scheduler_started
+    if _scheduler_started or not AUTO_CHECK:
+        return
+    _scheduler_started = True
+    threading.Thread(target=_scheduler_loop, daemon=True, name="auto-check").start()
+
+
+start_scheduler()
 
 
 if __name__ == "__main__":

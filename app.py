@@ -732,45 +732,61 @@ def _methods_text():
     return (f"Trend {'ON' if ENABLE_TREND else 'OFF'} | SMC {'ON' if ENABLE_SMC else 'OFF'} | "
             f"Forced {'ON' if ENABLE_FORCE else 'OFF'}")
 
+def _trend_emoji(d):
+    return "🟢 ▲ Up" if d == 1 else "🔴 ▼ Down" if d == -1 else "⚪ → Flat"
+
 
 def build_entry_message(entry, smc, bar_time, delay_sec, tag, htf_line):
-    """The Telegram alert for a new entry."""
+    """The Telegram alert for a new entry (emoji layout, easy to scan)."""
     side = entry["side"]
     sgn = 1 if side == "BUY" else -1
-    lines = [f"XAUUSD {side} signal {tag}"]
+    side_icon = "🟢" if side == "BUY" else "🔴"
+    setup_icon = {"TREND": "📈", "SMC": "🧠", "FORCED": "⏰"}.get(entry["setup"], "📈")
+    line = "━━━━━━━━━━━━━━"
 
+    L = [
+        f"{side_icon}{side_icon} {side} XAUUSD {side_icon}{side_icon}",
+        f"{setup_icon} {entry['setup']} {tag}",
+        line,
+    ]
+
+    # --- trade levels ---
     if ENTRY_MODE == "live":
         px_name = "ask" if side == "BUY" else "bid"
-        lines.append(f"ENTER NOW @ {entry['entry']:.2f} ({px_name})")
+        L.append(f"⚡ ENTER NOW: {entry['entry']:.2f} ({px_name})")
     else:
-        lines.append(f"Entry: {entry['entry']:.2f}")
+        L.append(f"📍 Entry: {entry['entry']:.2f}")
 
-    lines.append(f"SL: {entry['sl']:.2f}  ({entry['sl_dist']:.1f} pts)")
+    L.append(f"🛑 SL: {entry['sl']:.2f}  ({entry['sl_dist']:.1f} pts)")
     if PNL_MODE == "tp1_only":
-        lines.append(f"TP: {entry['tp1']:.2f}  ({entry['tp1_dist']:.1f} pts, full close)")
+        L.append(f"🎯 TP: {entry['tp1']:.2f}  ({entry['tp1_dist']:.1f} pts · full close)")
     else:
-        lines.append(f"TP1: {entry['tp1']:.2f}  ({entry['tp1_dist']:.1f} pts)")
-        lines.append(f"TP2: {entry['tp2']:.2f}  ({entry['tp2_dist']:.1f} pts)")
+        L.append(f"🎯 TP1: {entry['tp1']:.2f}  ({entry['tp1_dist']:.1f} pts)")
+        L.append(f"🏆 TP2: {entry['tp2']:.2f}  ({entry['tp2_dist']:.1f} pts)")
 
     if ENTRY_MODE == "live" and MAX_CHASE_PTS > 0:
         worst = entry["entry"] + sgn * MAX_CHASE_PTS
         way = "above" if side == "BUY" else "below"
-        lines.append(f"Max chase: {worst:.2f} (skip if price is already {way} this)")
-    lines.append("Tip: set SL/TP as POINTS from your own fill price.")
+        L.append(f"🚧 Max chase: {worst:.2f}")
+        L.append(f"   ↳ skip if price is already {way} this")
+    L.append("💡 Set SL/TP as POINTS from your own fill")
 
+    # --- analysis ---
+    L.append(line)
+    L.append(f"📊 Supertrend ({TIMEFRAME}): {_trend_emoji(entry['st_dir'])}")
+    if htf_line:
+        L.append(f"🔭 HTF ({HTF_TIMEFRAME}): {_trend_emoji(entry['htf_dir'])}")
+    L.append(f"🧠 SMC score  Long {smc['score_long']} | Short {smc['score_short']}")
+
+    # --- timing ---
+    L.append(line)
     if "signal_close" in entry:
         slip = (entry["entry"] - entry["signal_close"]) * sgn
-        lines.append(f"Signal candle close: {entry['signal_close']:.2f} | live vs close: {slip:+.2f} pts")
+        L.append(f"🕯 Candle close: {entry['signal_close']:.2f} (live vs close {slip:+.2f} pts)")
     if delay_sec is not None:
-        lines.append(f"Sent {delay_sec:.0f}s after candle close")
-
-    lines.append(f"Supertrend ({TIMEFRAME}): {trend_arrow(entry['st_dir'])}")
-    if htf_line:
-        lines.append(htf_line.strip())
-    lines.append(f"SMC score L/S: {smc['score_long']} / {smc['score_short']}")
-    lines.append(f"Bar: {bar_time} ({FORCE_TIMEZONE})")
-    return "\n".join(lines)
-
+        L.append(f"⏱ Sent {delay_sec:.0f}s after candle close")
+    L.append(f"🕒 {bar_time} ({FORCE_TIMEZONE})")
+    return "\n".join(L)
 
 def build_check_telegram_message(result, state):
     lines = ["📊 [Manual Check] XAUUSD", f"Bar: {result.get('bar_time')} ({FORCE_TIMEZONE})"]
@@ -988,15 +1004,28 @@ def manage_position(state, candle, silent=False):
             elif hit_tp2:
                 close_(pos["tp2"], "TP2 Hit (Final)")
 
-    if not silent:
+        if not silent:
         side = "BUY" if d == 1 else "SELL"
+        side_icon = "🟢" if d == 1 else "🔴"
+        line = "━━━━━━━━━━━━━━"
         for label, price, pnl in events:
-            if pnl is None:
-                msg = (f"XAUUSD {side} — {label}\nPrice: {price:.2f}\n"
-                       f"(Stop loss moved — no P&L booked yet, position still open)")
+            if pnl is None:  # TP1 hit, SL moved (ratchet mode)
+                msg = (f"🔒 {side_icon} XAUUSD {side} — TP1 HIT\n{line}\n"
+                       f"📍 Price: {price:.2f}\n"
+                       f"🛡 SL moved to locked profit\n"
+                       f"⏳ Position still open")
+            elif pnl > 0:
+                msg = (f"✅🏆 {side_icon} XAUUSD {side} — {label}\n{line}\n"
+                       f"📍 Exit: {price:.2f}\n"
+                       f"💰 Profit: +${pnl:.2f}")
+            elif pnl < 0:
+                msg = (f"❌ {side_icon} XAUUSD {side} — {label}\n{line}\n"
+                       f"📍 Exit: {price:.2f}\n"
+                       f"💸 Loss: -${abs(pnl):.2f}")
             else:
-                msg = (f"XAUUSD {side} — {label}\nPrice: {price:.2f}\n"
-                       f"P&L (trade closed): {'+' if pnl >= 0 else '-'}${abs(pnl):.2f}")
+                msg = (f"⚪ {side_icon} XAUUSD {side} — {label}\n{line}\n"
+                       f"📍 Exit: {price:.2f}\n"
+                       f"➖ Break-even: $0.00")
             send_telegram(msg)
 
     return len(events) > 0

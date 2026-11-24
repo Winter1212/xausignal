@@ -1004,7 +1004,7 @@ def manage_position(state, candle, silent=False):
             elif hit_tp2:
                 close_(pos["tp2"], "TP2 Hit (Final)")
 
-        if not silent:
+    if not silent:
         side = "BUY" if d == 1 else "SELL"
         side_icon = "🟢" if d == 1 else "🔴"
         line = "━━━━━━━━━━━━━━"

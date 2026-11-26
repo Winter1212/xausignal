@@ -14,27 +14,37 @@ from ea_control import register_ea_control
 inject_ea_ui = register_ea_control(app)
 
 # =====================================================================
-#  SYNCED WITH "Gold Signal Terminal v2.1 — Trend + SMC + Flow Proxy"
+#  SYNCED WITH "Gold Signal Terminal v2.2 — Trend + SMC + Flow Proxy"
+#
+#  v2.3 changes (bot):
+#   - FORCED daily trade now needs CONFIRMATION before it fires, exactly like
+#     the indicator's "Forced Trade Confirmation" group:
+#       FC_EMA_ALIGN, FC_PRICE_SIDE, FC_HTF, FC_ST_HOLD, FC_CANDLE,
+#       FC_PULLBACK, FC_MIN_SCORE, FC_MIN_CONFIRMS
+#     The forced trade fires once at least min(FC_MIN_CONFIRMS, enabled checks)
+#     checks pass (on top of the RSI + extension quality filters).
+#   - The "skip the day" rule (FORCE_SKIP_IF_NEVER_VALID) now looks at the
+#     full quality + confirmation result (same as the indicator).
+#   - /check, Telegram check message, dashboard and health show the forced
+#     confirmation progress (e.g. "2/3").
+#   - Trend and SMC logic are untouched. All default VALUES are unchanged.
 #
 #  v2.2 changes (execution / timing):
-#   - PNL_MODE now defaults to "tp1_only": the WHOLE trade closes at TP1.
+#   - PNL_MODE defaults to "tp1_only": the WHOLE trade closes at TP1.
 #     TP1 is a fixed TP1_PTS (default 20 points) from entry. Set TP1_PTS=0
 #     to go back to SL x RR1.
 #   - ENTRY_MODE (default "live"): the entry in the alert is the CURRENT
 #     ask (BUY) / bid (SELL) at the moment the alert is sent, and SL/TP are
-#     rebuilt from that price (same point distances). The bot's open position
-#     uses the same price, so your entry and the bot's entry match.
-#     ENTRY_MODE=signal_close keeps the old behaviour (close of the signal bar).
+#     rebuilt from that price (same point distances). ENTRY_MODE=signal_close
+#     keeps the old behaviour (close of the signal bar).
 #   - The alert shows SL/TP in POINTS too, a max-chase price, how many
 #     seconds after the candle close it was sent, and how far the live price
 #     is from the signal candle close.
 #   - AUTO_CHECK (default true): a background scheduler runs /check a few
-#     seconds after every candle close (retries until the new closed candle is
-#     available), so the alert no longer waits for an external cron.
-#     Keep your cron as a backup / keep-alive. Run gunicorn with ONE worker.
+#     seconds after every candle close. Keep your cron as a backup.
+#     Run gunicorn with ONE worker.
 #   - One Capital.com session is reused for all requests inside /check.
 #   - A lock stops two /check calls (cron + scheduler) from running at once.
-#   - All other default VALUES are unchanged.
 # =====================================================================
 
 
@@ -70,7 +80,7 @@ FORCE_TIMEZONE = os.environ.get("FORCE_TIMEZONE", "Asia/Phnom_Penh")
 ENABLE_TREND = _env_bool("ENABLE_TREND", True)
 ENABLE_SMC   = _env_bool("ENABLE_SMC",   _env_bool("USE_SMC_TRIGGER", True))
 ENABLE_FORCE = _env_bool("ENABLE_FORCE", _env_bool("GUARANTEE_DAILY_TRADE", True))
-# SMC only after the forced trade of the day has closed (indicator v2.1)
+# SMC only after the forced trade of the day has closed (indicator v2.1+)
 SMC_AFTER_FORCE = _env_bool("SMC_AFTER_FORCE", True)
 
 # ---------------------- SESSION FILTERS ----------------------
@@ -153,14 +163,24 @@ FORCE_HARD_HOUR   = _env_int("FORCE_HARD_HOUR", 10)
 FORCE_HARD_MINUTE = _env_int("FORCE_HARD_MINUTE", 0)
 FORCE_SKIP_IF_NEVER_VALID = _env_bool("FORCE_SKIP_IF_NEVER_VALID", False)
 
+# ---------------------- FORCED TRADE CONFIRMATION (indicator v2.2) ----------------------
+FC_EMA_ALIGN    = _env_bool("FC_EMA_ALIGN", True)     # Fast EMA vs Slow EMA agrees with the direction
+FC_PRICE_SIDE   = _env_bool("FC_PRICE_SIDE", True)    # close on the correct side of the Fast EMA
+FC_HTF          = _env_bool("FC_HTF", True)           # HTF Supertrend agrees (only counts when USE_HTF)
+FC_ST_HOLD      = _env_bool("FC_ST_HOLD", True)       # Supertrend flip confirmed + agrees
+FC_CANDLE       = _env_bool("FC_CANDLE", False)        # confirmation candle (close beyond prev close)
+FC_PULLBACK     = _env_bool("FC_PULLBACK", False)     # price near Fast EMA (pullback OK)
+FC_MIN_SCORE    = _env_int("FC_MIN_SCORE", 0)         # min SMC score (0 = off)
+FC_MIN_CONFIRMS = max(1, min(7, _env_int("FC_MIN_CONFIRMS", 3)))   # how many enabled checks must pass
+
 # ---------------------- RISK MANAGEMENT ----------------------
 ATR_LEN    = _env_int("ATR_LEN", 20)
 SL_MULT    = _env_float("SL_MULT", 1.5)
 SL_MIN_PTS = _env_float("SL_MIN_PTS", 10)
 SL_MAX_PTS = _env_float("SL_MAX_PTS", 10)
 RR1 = _env_float("RR1", 2.0)
-RR2 = _env_float("RR2", 3.0)
-LOCK_PTS   = _env_float("LOCK_PTS", 10)
+RR2 = _env_float("RR2", 2.0)
+LOCK_PTS   = _env_float("LOCK_PTS", 20)
 SPREAD_PTS = _env_float("SPREAD_PTS", 0)
 
 # Fixed take-profit distance (price points). The whole trade closes here when
@@ -177,7 +197,7 @@ if PNL_MODE not in ("ratchet", "tp1_only", "first_hit"):
 MAX_LOSSES_PER_DAY = _env_int("MAX_LOSSES_PER_DAY", 2)   # 0 = unlimited
 COOLDOWN_BARS      = _env_int("COOLDOWN_BARS", 6)
 
-LOT_SIZE      = _env_float("LOT_SIZE", 0.1)
+LOT_SIZE      = _env_float("LOT_SIZE", 1)
 UNITS_PER_LOT = _env_float("UNITS_PER_LOT", 100)
 
 # ---------------------- ENTRY PRICE / ALERT TIMING ----------------------
@@ -736,6 +756,21 @@ def _trend_emoji(d):
     return "🟢 ▲ Up" if d == 1 else "🔴 ▼ Down" if d == -1 else "⚪ → Flat"
 
 
+def _force_status_text(fc, state):
+    """One-line forced-trade status for the check message (None = nothing to show)."""
+    if not ENABLE_FORCE or not fc:
+        return None
+    if state.get("traded_today"):
+        return "Traded today"
+    if state.get("force_skipped_today"):
+        return "Skipped (never valid)"
+    if not fc.get("past_force_time"):
+        return "Not yet due"
+    if fc.get("all_ok"):
+        return "Ready to fire"
+    return f"Waiting confirm {fc.get('passed', 0)}/{fc.get('needed', 0)}"
+
+
 def build_entry_message(entry, smc, bar_time, delay_sec, tag, htf_line):
     """The Telegram alert for a new entry (emoji layout, easy to scan)."""
     side = entry["side"]
@@ -777,6 +812,9 @@ def build_entry_message(entry, smc, bar_time, delay_sec, tag, htf_line):
     if htf_line:
         L.append(f"🔭 HTF ({HTF_TIMEFRAME}): {_trend_emoji(entry['htf_dir'])}")
     L.append(f"🧠 SMC score  Long {smc['score_long']} | Short {smc['score_short']}")
+    fc = entry.get("force_confirm")
+    if entry["setup"] == "FORCED" and fc and fc.get("checks", 0) > 0:
+        L.append(f"✅ Forced confirm: {fc['passed']}/{fc['needed']} checks")
 
     # --- timing ---
     L.append(line)
@@ -813,6 +851,9 @@ def build_check_telegram_message(result, state):
     smc_info = result.get("smc") or {}
     if SMC_AFTER_FORCE and ENABLE_FORCE and ENABLE_SMC and "unlocked" in smc_info:
         lines.append(f"SMC lock: {'UNLOCKED' if smc_info['unlocked'] else 'locked (waiting on Forced)'}")
+    force_txt = _force_status_text(result.get("force"), state)
+    if force_txt:
+        lines.append(f"Forced trade: {force_txt}")
 
     pos = state.get("position")
     if pos:
@@ -861,6 +902,9 @@ def build_stats_telegram_message(payload, state):
         f"{dg['force_hour']:02d}:{dg['force_minute']:02d} {dg['force_timezone']} | "
         f"traded today: {'yes' if dg['traded_today'] else 'no'}"
     )
+    fcfg = dg.get("confirmation", {})
+    if dg["enabled"] and fcfg:
+        lines.append(f"Forced confirmation: need {fcfg.get('min_confirms')} of {fcfg.get('enabled_checks')} checks")
     rg = payload.get("risk_guard", {})
     lines.append(f"Losses today: {rg.get('losses_today', 0)} / {rg.get('max_losses_per_day') or '∞'}")
     th = payload.get("trading_hours", {})
@@ -907,7 +951,7 @@ def settle_trade(state, pos, exit_price, result_label, bar_time):
     s["best_trade"] = pnl if s["best_trade"] is None else max(s["best_trade"], pnl)
     s["worst_trade"] = pnl if s["worst_trade"] is None else min(s["worst_trade"], pnl)
 
-    # Indicator v2.1: a FORCED trade only unlocks today's SMC if it was ENTERED
+    # Indicator v2.1+: a FORCED trade only unlocks today's SMC if it was ENTERED
     # the same calendar day it closed (a forced trade carried past midnight must
     # not unlock the new day's SMC).
     if setup == "FORCED" and str(pos.get("entry_time", ""))[:10] == str(bar_time)[:10]:
@@ -1046,15 +1090,64 @@ def roll_daily_guarantee_state(state, bar_dt):
         state["losses_today"] = 0
 
 
-def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_last,
-                        rsi_val, extension_atr, risk_ok):
+def compute_force_confirmation(force_direction, ema_fast, ema_slow, close_, h_dir,
+                               st_dir, st_flip_confirmed, bull_confirm, bear_confirm,
+                               pullback_ok, score_long, score_short):
+    """
+    Port of the indicator's "FORCED TRADE CONFIRMATION" block.
+    Returns (checks, passed, needed, confirm_ok).
+      checks = how many confirmation checks are enabled
+      passed = how many of them pass right now
+      needed = min(FC_MIN_CONFIRMS, checks)
+    """
+    d_long = force_direction == 1
+    checks = 0
+    passed = 0
+
+    if FC_EMA_ALIGN:
+        checks += 1
+        passed += int(bool(ema_fast > ema_slow) if d_long else bool(ema_fast < ema_slow))
+    if FC_PRICE_SIDE:
+        checks += 1
+        passed += int(bool(close_ > ema_fast) if d_long else bool(close_ < ema_fast))
+    if FC_HTF:
+        checks += 1
+        passed += int((not USE_HTF) or h_dir == force_direction)
+    if FC_ST_HOLD:
+        checks += 1
+        passed += int(bool(st_flip_confirmed) and st_dir == force_direction)
+    if FC_CANDLE:
+        checks += 1
+        passed += int(bool(bull_confirm) if d_long else bool(bear_confirm))
+    if FC_PULLBACK:
+        checks += 1
+        passed += int(bool(pullback_ok))
+    if FC_MIN_SCORE > 0:
+        checks += 1
+        passed += int((score_long if d_long else score_short) >= FC_MIN_SCORE)
+
+    needed = min(FC_MIN_CONFIRMS, checks)
+    confirm_ok = checks == 0 or passed >= needed
+    return checks, passed, needed, confirm_ok
+
+
+def compute_force_entry(state, bar_dt, bar, smc, h_dir, extension_atr, risk_ok,
+                        st_flip_confirmed, bull_confirm, bear_confirm, pullback_ok):
+    """
+    Returns (force_entry_now, force_direction, fc_info).
+    fc_info is None when the forced method is disabled.
+    """
     if not ENABLE_FORCE:
-        return False, 0
+        return False, 0, None
+
+    st_dir = int(bar["st_dir"])
+    ema_fast_last, ema_slow_last = bar["emaFast"], bar["emaSlow"]
+    rsi_val = bar["rsi"]
 
     if st_dir in (1, -1):
         force_direction = st_dir
-    elif htf_dir in (1, -1):
-        force_direction = htf_dir
+    elif h_dir in (1, -1):
+        force_direction = h_dir
     else:
         force_direction = 1 if ema_fast_last >= ema_slow_last else -1
 
@@ -1066,13 +1159,21 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
     force_extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
     force_quality_ok = (not FORCE_REQUIRE_QUALITY_FILTERS) or (force_rsi_ok and force_extension_ok)
 
-    if (is_past_hard_time and not force_quality_ok and FORCE_REQUIRE_QUALITY_FILTERS
+    # --- confirmation layer (indicator v2.2) ---
+    checks, passed, needed, confirm_ok = compute_force_confirmation(
+        force_direction, ema_fast_last, ema_slow_last, bar["close"], h_dir,
+        st_dir, st_flip_confirmed, bull_confirm, bear_confirm,
+        pullback_ok, smc["score_long"], smc["score_short"],
+    )
+    force_all_ok = bool(force_quality_ok and confirm_ok)
+
+    if (is_past_hard_time and not force_all_ok
             and FORCE_SKIP_IF_NEVER_VALID and not state["traded_today"]):
         if not state.get("force_skipped_today"):
             state["force_skipped_bar_time"] = str(bar_dt)
         state["force_skipped_today"] = True
 
-    force_can_fire_now = force_quality_ok or (is_past_hard_time and not FORCE_SKIP_IF_NEVER_VALID)
+    force_can_fire_now = force_all_ok or (is_past_hard_time and not FORCE_SKIP_IF_NEVER_VALID)
 
     force_entry_now = (
         is_past_force_time
@@ -1083,7 +1184,16 @@ def compute_force_entry(state, bar_dt, st_dir, htf_dir, ema_fast_last, ema_slow_
         and force_can_fire_now
         and not state.get("force_skipped_today", False)
     )
-    return force_entry_now, force_direction
+
+    fc_info = {
+        "direction": int(force_direction),
+        "checks": int(checks), "passed": int(passed), "needed": int(needed),
+        "quality_ok": bool(force_quality_ok), "confirm_ok": bool(confirm_ok),
+        "all_ok": force_all_ok,
+        "past_force_time": bool(is_past_force_time),
+        "past_hard_time": bool(is_past_hard_time),
+    }
+    return bool(force_entry_now), force_direction, fc_info
 
 
 # ---------------------- SMC LOCK (SMC only after Forced closes) ----------------------
@@ -1187,6 +1297,7 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
     df needs: emaFast, emaSlow, rsi, atr, st_dir, bars_since_flip, htf_st_dir.
     Each method (TREND / SMC / FORCED) is gated by its ENABLE_* switch.
     SMC is additionally gated by the "SMC only after Forced closes" lock.
+    FORCED additionally needs its confirmation checks (FC_*).
     """
     bar = df.iloc[i]
     prev = df.iloc[i - 1]
@@ -1224,6 +1335,10 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
     extension_ok = (not USE_EXTENSION_FILTER) or extension_atr <= MAX_EXTENSION_ATR
     pullback_ok = extension_atr <= PULLBACK_MAX_ATR
 
+    # confirmation candles (used by the SMC trigger AND the forced-trade confirmation)
+    bull_confirm = close_ > open_ and close_ > prev["close"]
+    bear_confirm = close_ < open_ and close_ < prev["close"]
+
     base_long_cond = ema_cross_up and rsi_ok_long and st_bullish and st_flip_confirmed and htf_bullish
     base_short_cond = ema_cross_down and rsi_ok_short and st_bearish and st_flip_confirmed and htf_bearish
 
@@ -1245,9 +1360,9 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
 
     # FORCED method (returns False when ENABLE_FORCE is off). Evaluated BEFORE the
     # SMC block because it can set force_skipped_today, which unlocks SMC.
-    force_entry_now, force_direction = compute_force_entry(
-        state, bar_dt, int(bar["st_dir"]), h_dir, bar["emaFast"], bar["emaSlow"],
-        bar["rsi"], extension_atr, risk_ok,
+    force_entry_now, force_direction, fc_info = compute_force_entry(
+        state, bar_dt, bar, smc, h_dir, extension_atr, risk_ok,
+        st_flip_confirmed, bull_confirm, bear_confirm, pullback_ok,
     )
     force_long = force_entry_now and force_direction == 1
     force_short = force_entry_now and force_direction == -1
@@ -1268,8 +1383,6 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
     fresh_low = _fresh(smc.get("sweep_low_bar"))
     fresh_high = _fresh(smc.get("sweep_high_bar"))
 
-    bull_confirm = close_ > open_ and close_ > prev["close"]
-    bear_confirm = close_ < open_ and close_ < prev["close"]
     vol_ok = (not REQUIRE_VOL_SPIKE) or smc["vol_spike"]
     smc_long = (ENABLE_SMC and smc_unlocked and risk_ok and smc["recent_sweep_low"] and fresh_low
                 and bull_confirm and htf_bullish and rsi_ok_long and vol_ok
@@ -1284,6 +1397,7 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
     info["htf_dir"] = h_dir
     info["st_dir"] = int(bar["st_dir"])
     info["smc_unlocked"] = bool(smc_unlocked)
+    info["force_confirm"] = fc_info
 
     is_long = long_cond or smc_long or force_long
     is_short = short_cond or smc_short or force_short
@@ -1319,6 +1433,7 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
         "forced": setup == "FORCED", "smc": setup == "SMC",
         "pullback": USE_PULLBACK_ENTRY and setup == "TREND",
         "htf_dir": h_dir, "st_dir": int(bar["st_dir"]),
+        "force_confirm": fc_info,
     }
     return entry_dict, info
 
@@ -1327,9 +1442,10 @@ def evaluate_entry(state, df, i, smc, bars_since_exit):
 def run_signal_backtest(target_count=120, initial_days=30, max_days=730):
     """
     Replays the bot's own logic (Trend / SMC / Forced, honouring the ENABLE_*
-    switches and the SMC-after-Forced lock) on closed bars only, with the same
-    HTF handling, spread, cooldown, loss cap and SMC engine as live, until
-    `target_count` signals are found. (Entries use the signal candle close.)
+    switches, the forced confirmation layer and the SMC-after-Forced lock) on
+    closed bars only, with the same HTF handling, spread, cooldown, loss cap
+    and SMC engine as live, until `target_count` signals are found.
+    (Entries use the signal candle close.)
     """
     headers = _capital_session_headers()
     days = initial_days
@@ -1539,6 +1655,7 @@ def _check_impl():
             result["smc"] = {"score_long": smc["score_long"], "score_short": smc["score_short"],
                              "structure": smc["struct_dir"],
                              "unlocked": info.get("smc_unlocked")}
+            result["force"] = info.get("force_confirm")
 
             if entry:
                 # how long after the signal candle closed are we?
@@ -1579,6 +1696,8 @@ def _check_impl():
     result["position"] = state.get("position")
     result["trade_methods"] = {"trend": ENABLE_TREND, "smc": ENABLE_SMC, "forced": ENABLE_FORCE}
     result["smc_after_force"] = SMC_AFTER_FORCE
+    if result.get("force") is not None:
+        result["force_status"] = _force_status_text(result["force"], state)
 
     if _notify_requested():
         send_telegram(build_check_telegram_message(result, state))
@@ -1592,6 +1711,18 @@ def check():
     # one /check at a time (cron + background scheduler must not overlap)
     with _CHECK_LOCK:
         return _check_impl()
+
+
+def _force_confirmation_config():
+    enabled_checks = (int(FC_EMA_ALIGN) + int(FC_PRICE_SIDE) + int(FC_HTF) + int(FC_ST_HOLD)
+                      + int(FC_CANDLE) + int(FC_PULLBACK) + int(FC_MIN_SCORE > 0))
+    return {
+        "ema_align": FC_EMA_ALIGN, "price_side": FC_PRICE_SIDE, "htf": FC_HTF,
+        "st_hold": FC_ST_HOLD, "candle": FC_CANDLE, "pullback": FC_PULLBACK,
+        "min_score": FC_MIN_SCORE,
+        "enabled_checks": enabled_checks,
+        "min_confirms": min(FC_MIN_CONFIRMS, enabled_checks) if enabled_checks else 0,
+    }
 
 
 @app.route("/stats", methods=["GET"])
@@ -1628,6 +1759,7 @@ def stats():
             "require_quality_filters": FORCE_REQUIRE_QUALITY_FILTERS,
             "hard_cutoff_hour": FORCE_HARD_HOUR, "hard_cutoff_minute": FORCE_HARD_MINUTE,
             "skip_if_never_valid": FORCE_SKIP_IF_NEVER_VALID,
+            "confirmation": _force_confirmation_config(),
         },
         "risk_guard": {
             "losses_today": state.get("losses_today", 0),
@@ -1734,7 +1866,7 @@ def capital_status():
 def health():
     return jsonify({
         "status": "ok",
-        "synced_with": "Gold Signal Terminal v2.1 (Trend + SMC + Flow Proxy)",
+        "synced_with": "Gold Signal Terminal v2.2 (Trend + SMC + Flow Proxy)",
         "data_provider": "Capital.com",
         "capital_configured": bool(CAPITAL_API_KEY and CAPITAL_IDENTIFIER and CAPITAL_PASSWORD),
         "capital_base_url": CAPITAL_BASE_URL,
@@ -1770,6 +1902,7 @@ def health():
         "force": f"{FORCE_HOUR:02d}:{FORCE_MINUTE:02d} {FORCE_TIMEZONE}, hard {FORCE_HARD_HOUR:02d}:{FORCE_HARD_MINUTE:02d}",
         "force_require_quality_filters": FORCE_REQUIRE_QUALITY_FILTERS,
         "force_skip_if_never_valid": FORCE_SKIP_IF_NEVER_VALID,
+        "force_confirmation": _force_confirmation_config(),
         "disable_weekend_signals": DISABLE_WEEKEND_SIGNALS,
         "trading_hours": f"{TRADING_START_HOUR:02d}:{TRADING_START_MINUTE:02d}-{TRADING_END_HOUR:02d}:{TRADING_END_MINUTE:02d}" if USE_TRADING_HOURS else None,
         "selected_days": [name for name, flag in _DAY_LABEL_FLAGS if flag] if USE_DAY_FILTER else None,
@@ -2140,7 +2273,7 @@ function renderCheck(data){
         <div class="stat-box"><div class="k">Stop Loss</div><div class="v neg">${fmtPrice(data.sl)}</div></div>
         <div class="stat-box"><div class="k">TP1 / TP2</div><div class="v pos" style="font-size:12.5px">${fmtPrice(data.tp1)} · ${fmtPrice(data.tp2)}</div></div>
       </div>
-      ${data.forced ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">⚡ Opened by the Daily Trade Guarantee fallback, not the organic signal stack.</p>` : ''}
+      ${data.forced ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">⚡ Opened by the Daily Trade Guarantee fallback (after its confirmation checks), not the organic signal stack.</p>` : ''}
       ${data.smc_entry ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">◆ Standalone SMC setup: liquidity sweep + confirmation candle.</p>` : ''}
       ${data.pullback ? `<p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">↩ Opened after a pullback confirmation, not on the initial cross bar.</p>` : ''}
     `;
@@ -2157,6 +2290,16 @@ function renderCheck(data){
     if(data.smc_after_force && data.trade_methods && data.trade_methods.forced && data.smc.unlocked !== undefined && data.smc.unlocked !== null){
       smcBlock += `<div class="kv"><span class="k">SMC lock (after Forced)</span><span class="v">${data.smc.unlocked ? 'UNLOCKED' : 'Locked (waiting on Forced)'}</span></div>`;
     }
+  }
+
+  let forceBlock = '';
+  if(data.force && data.trade_methods && data.trade_methods.forced){
+    const f = data.force;
+    forceBlock = `
+      <div class="kv"><span class="k">Forced trade</span><span class="v">${esc(data.force_status || '—')}</span></div>
+      <div class="kv"><span class="k">Forced confirm (passed / needed)</span><span class="v">${f.passed} / ${f.needed} of ${f.checks} checks</span></div>
+      <div class="kv"><span class="k">Forced quality (RSI + extension)</span><span class="v">${f.quality_ok ? 'OK' : 'Blocked'}</span></div>
+    `;
   }
 
   let sessionBlock = '';
@@ -2181,6 +2324,7 @@ function renderCheck(data){
         ${sessionBlock}
         ${pendingBlock}
         ${smcBlock}
+        ${forceBlock}
         ${methodsKv(data.trade_methods)}
         <div class="section-label">Current Position</div>
         ${positionKv(data.position)}
@@ -2208,6 +2352,7 @@ function renderStats(data){
   }).join('') || `<tr><td colspan="6" style="color:var(--text-faint);text-align:center;">No trades logged yet</td></tr>`;
 
   const dg = data.daily_guarantee || {};
+  const fcfg = dg.confirmation || {};
   const ps = data.pending_signal || {};
   const th = data.trading_hours || {};
   const df = data.day_filter || {};
@@ -2254,6 +2399,7 @@ function renderStats(data){
         <div class="section-label">Daily Trade Guarantee</div>
         <div class="kv"><span class="k">Status</span><span class="v">${dg.enabled ? 'Enabled' : 'Disabled'} @ ${String(dg.force_hour).padStart(2,'0')}:${String(dg.force_minute).padStart(2,'0')}</span></div>
         <div class="kv"><span class="k">Traded today</span><span class="v">${dg.traded_today ? 'Yes' : 'No'}</span></div>
+        <div class="kv"><span class="k">Confirmation needed</span><span class="v">${fcfg.min_confirms !== undefined ? fcfg.min_confirms + ' of ' + fcfg.enabled_checks + ' checks' : '—'}</span></div>
 
         <div class="section-label">Trading Hours</div>
         <div class="kv"><span class="k">Window</span><span class="v">${th.enabled ? `${String(th.start_hour).padStart(2,'0')}:${String(th.start_minute).padStart(2,'0')}-${String(th.end_hour).padStart(2,'0')}:${String(th.end_minute).padStart(2,'0')}` : 'Off (24h)'}</span></div>

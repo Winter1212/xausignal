@@ -134,7 +134,7 @@ HTF_FACTOR     = _env_float("HTF_FACTOR", 8)
 # ---------------------- SMC ----------------------
 USE_SMC_GATE      = _env_bool("USE_SMC_GATE", True)
 GATE_MIN_SCORE    = _env_int("GATE_MIN_SCORE", 3)
-TRIG_MIN_SCORE    = _env_int("TRIG_MIN_SCORE", 3)
+TRIG_MIN_SCORE    = _env_int("TRIG_MIN_SCORE", 2)
 SWING_LEN         = _env_int("SWING_LEN", 5)
 SWEEP_LOOKBACK    = _env_int("SWEEP_LOOKBACK", 2)
 FVG_MIN_ATR       = _env_float("FVG_MIN_ATR", 1.5)
